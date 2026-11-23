@@ -171,11 +171,9 @@ export const uploadFile = async (
 
         try {
             return await uploadViaSignedUrl(context, storagePath, processedFile);
-        } catch (cfErr) {
-            console.warn('[STORAGE] Signed URL upload failed in uploadFile, attempting direct fallback:', cfErr);
-            const storageRef = ref(storage, storagePath);
-            const snapshot = await uploadBytes(storageRef, processedFile);
-            return snapshot.ref.fullPath;
+        } catch (cfErr: any) {
+            console.error('[STORAGE] Signed URL upload failed in uploadFile:', cfErr);
+            throw new Error(cfErr?.message || 'Secure upload service unavailable. Please retry.');
         }
     } catch (error) {
         console.error("Error uploading file:", error);
@@ -443,28 +441,16 @@ export const uploadSubmissionDocument = async (
     const uid = user?.uid;
     if (!uid) throw new Error('User must be authenticated to upload documents.');
 
-    // Prefer customFolder, then active draft ID from session/local storage, then user UID
-    let draftId: string | null = null;
-    if (customFolder) {
-        draftId = customFolder;
-    } else if (typeof window !== 'undefined') {
-        try {
-            const raw = sessionStorage.getItem('onboarding_savedDraftId') || localStorage.getItem('onboarding_savedDraftId');
-            if (raw) {
-                draftId = typeof raw === 'string' && raw.startsWith('"') ? JSON.parse(raw) : raw;
-            }
-        } catch {}
-    }
-    const folderName = draftId || uid;
+    // Prefer customFolder if explicitly provided, otherwise fallback to user UID which is always authorized by getUploadUrl
+    const folderName = customFolder || uid;
     const storagePath = `onboarding/${folderName}/${fieldId}/${safeName}`;
 
     try {
         // Primary: Cloud Function signed URL (no storage rules, no query limit)
         return await uploadViaSignedUrl('onboarding', storagePath, processedFile, onProgress);
-    } catch (cfError) {
-        console.warn('[STORAGE] Signed URL upload failed, falling back to direct upload:', cfError);
-        // Fallback: Direct upload (works if storage rules permit)
-        return uploadDocumentWithProgress(processedFile, storagePath, onProgress);
+    } catch (cfError: any) {
+        console.error('[STORAGE] Signed URL upload failed:', cfError);
+        throw new Error(cfError?.message || 'Secure upload service unavailable. Please retry.');
     }
 };
 
@@ -476,9 +462,9 @@ export const uploadEmployeeDocument = async (
     const storagePath = `employees/${employeeId}/joining/${docType}_${file.name}`;
     try {
         return await uploadViaSignedUrl('employee', storagePath, file);
-    } catch (cfError) {
-        console.warn('[STORAGE] Signed URL upload failed, falling back to direct upload:', cfError);
-        return uploadFile(file, `employees/${employeeId}/joining`, `${docType}_${file.name}`);
+    } catch (cfError: any) {
+        console.error('[STORAGE] Signed URL upload failed:', cfError);
+        throw new Error(cfError?.message || 'Secure upload service unavailable. Please retry.');
     }
 };
 
@@ -493,7 +479,9 @@ export const uploadSubmissionAttachment = async (
     }
     const uid = user?.uid;
     if (!uid) throw new Error('User must be authenticated to upload documents.');
-    return uploadFile(file, `onboarding/${uid}`);
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const storagePath = `onboarding/${uid}/${safeName}`;
+    return uploadViaSignedUrl('onboarding', storagePath, file);
 };
 
 /**
@@ -502,17 +490,18 @@ export const uploadSubmissionAttachment = async (
  */
 export const uploadProfilePhoto = async (
     userId: string,
-    file: File
+    file: File,
+    userType: 'employees' | 'staff_accounts' = 'employees'
 ): Promise<string> => {
     try {
         const compressed = await compressImage(file, 400, 0.8);
-        const ext = file.name.split('.').pop() || 'jpg';
-        const storagePath = `employees/${userId}/profile/avatar.${ext}`;
+        const folder = userType === 'staff_accounts' ? 'staff_accounts' : 'employees';
+        const storagePath = `${folder}/${userId}/profile/avatar.jpg`;
         try {
             return await uploadViaSignedUrl('profile', storagePath, compressed);
-        } catch (cfError) {
-            console.warn('[STORAGE] Signed URL upload failed, falling back to direct upload:', cfError);
-            return uploadFile(compressed, `employees/${userId}/profile`, `avatar.${ext}`);
+        } catch (cfError: any) {
+            console.error('[STORAGE] Signed URL upload failed:', cfError);
+            throw new Error(cfError?.message || 'Secure upload service unavailable. Please retry.');
         }
     } catch (error) {
         console.error('Error uploading profile photo:', error);

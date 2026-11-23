@@ -185,6 +185,23 @@
             ]
         },
         {
+            "collectionGroup": "leave_requests",
+            "queryScope": "COLLECTION",
+            "fields": [
+                { "fieldPath": "employeeId", "order": "ASCENDING" },
+                { "fieldPath": "status", "order": "ASCENDING" }
+            ]
+        },
+        {
+            "collectionGroup": "leave_requests",
+            "queryScope": "COLLECTION",
+            "fields": [
+                { "fieldPath": "siteId", "order": "ASCENDING" },
+                { "fieldPath": "status", "order": "ASCENDING" },
+                { "fieldPath": "createdAt", "order": "DESCENDING" }
+            ]
+        },
+        {
             "collectionGroup": "account_updates",
             "queryScope": "COLLECTION",
             "fields": [
@@ -231,6 +248,40 @@
                 { "fieldPath": "status", "order": "ASCENDING" },
                 { "fieldPath": "siteId", "order": "ASCENDING" },
                 { "fieldPath": "submittedAt", "order": "DESCENDING" }
+            ]
+        },
+        {
+            "collectionGroup": "bgv_records",
+            "queryScope": "COLLECTION",
+            "fields": [
+                { "fieldPath": "siteId", "order": "ASCENDING" },
+                { "fieldPath": "status", "order": "ASCENDING" },
+                { "fieldPath": "createdAt", "order": "DESCENDING" }
+            ]
+        },
+        {
+            "collectionGroup": "bgv_records",
+            "queryScope": "COLLECTION",
+            "fields": [
+                { "fieldPath": "siteId", "order": "ASCENDING" },
+                { "fieldPath": "createdAt", "order": "DESCENDING" }
+            ]
+        },
+        {
+            "collectionGroup": "bgv_records",
+            "queryScope": "COLLECTION",
+            "fields": [
+                { "fieldPath": "vendorId", "order": "ASCENDING" },
+                { "fieldPath": "status", "order": "ASCENDING" },
+                { "fieldPath": "createdAt", "order": "DESCENDING" }
+            ]
+        },
+        {
+            "collectionGroup": "audit_logs",
+            "queryScope": "COLLECTION",
+            "fields": [
+                { "fieldPath": "actorId", "order": "ASCENDING" },
+                { "fieldPath": "timestamp", "order": "DESCENDING" }
             ]
         }
     ],

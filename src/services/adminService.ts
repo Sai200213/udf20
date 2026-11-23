@@ -4,6 +4,7 @@ import { doc, onSnapshot, setDoc, getDoc, updateDoc, collection, query, getDocs,
 import { Role, Site, WorkflowConfig, PortalConfig } from '../../types';
 import { logSystemAction } from './auditService';
 import { defaultFormSections } from '../constants/defaults';
+import { saveAllSites } from './siteService';
 
 export const SETTINGS_COLLECTION = 'settings';
 const ROLES_DOC_ID = 'roles';
@@ -41,15 +42,18 @@ export const subscribeToFormSections = (callback: (sections: any[]) => void) => 
             if (!Array.isArray(sections) || sections.length === 0) {
                 sections = defaultFormSections;
             }
-            // Ensure Job Details has Unit or Facility (order 1) before Post of Apply (order 2)
+            // Ensure Job Details has Unit or Facility before Post of Apply without order collisions (UDF-AUD-65)
             sections = sections.map((s: any) => {
                 if ((s.name === 'Job Details' || s.id === 'eb4bf8a6-a8bd-4563-817d-792716e6474c') && Array.isArray(s.fields)) {
                     const unitField = s.fields.find((f: any) => f.id === '52ae217b-2602-4337-a1cd-a1f9bd36a4b0' || f.label === 'Unit or Facility');
                     const postField = s.fields.find((f: any) => f.id === 'db307195-cf54-4a6e-9056-f3974b050c4d' || f.label === 'Post of Apply' || f.label === 'Designation');
                     if (unitField && postField) {
-                        unitField.order = 1;
-                        postField.order = 2;
-                        s.fields.sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0));
+                        const otherFields = s.fields.filter((f: any) => f !== unitField && f !== postField);
+                        const orderedFields = [unitField, postField, ...otherFields].map((f: any, idx: number) => ({
+                            ...f,
+                            order: idx + 1
+                        }));
+                        return { ...s, fields: orderedFields };
                     }
                 }
                 return s;
@@ -147,8 +151,8 @@ export const subscribeToSites = (callback: (sites: Site[]) => void) => {
 };
 
 export const updateSites = async (sites: Site[]) => {
-    await setDoc(doc(db, SETTINGS_COLLECTION, SITES_DOC_ID), { sites });
-    await logSystemAction('UPDATE', 'SITES', `Updated sites roster (${sites.length} sites)`);
+    // Atomically save and clean site records to prevent document corruption (UDF-AUD-271)
+    await saveAllSites(sites);
 };
 
 // --- Workflow Configs ---
@@ -263,47 +267,29 @@ export const seedInitialData = async (
     defaultEditableFields: string[]
 ) => {
     try {
-        const rolesSnap = await getDoc(doc(db, SETTINGS_COLLECTION, ROLES_DOC_ID));
-        if (!rolesSnap.exists()) {
+        const rolesColSnap = await getDocs(collection(db, ROLES_COLLECTION));
+        if (rolesColSnap.empty) {
             await updateRoles(defaultRoles);
             log.log("Seeded Roles");
         }
 
-        const sitesSnap = await getDoc(doc(db, SETTINGS_COLLECTION, SITES_DOC_ID));
-        if (!sitesSnap.exists()) {
-            await updateSites(defaultSites);
-            log.log("Seeded Sites");
-        }
+        const [sitesSnap, workflowsSnap, configSnap, policySnap, sectionsSnap, fieldsSnap] = await Promise.all([
+            getDoc(doc(db, SETTINGS_COLLECTION, SITES_DOC_ID)),
+            getDoc(doc(db, SETTINGS_COLLECTION, WORKFLOWS_DOC_ID)),
+            getDoc(doc(db, SETTINGS_COLLECTION, PORTAL_CONFIG_DOC_ID)),
+            getDoc(doc(db, SETTINGS_COLLECTION, LEAVE_POLICY_DOC_ID)),
+            getDoc(doc(db, SETTINGS_COLLECTION, FORM_SECTIONS_DOC_ID)),
+            getDoc(doc(db, SETTINGS_COLLECTION, EDITABLE_FIELDS_DOC_ID))
+        ]);
 
-        const workflowsSnap = await getDoc(doc(db, SETTINGS_COLLECTION, WORKFLOWS_DOC_ID));
-        if (!workflowsSnap.exists()) {
-            await updateWorkflows(defaultWorkflows);
-            log.log("Seeded Workflows");
-        }
-
-        const configSnap = await getDoc(doc(db, SETTINGS_COLLECTION, PORTAL_CONFIG_DOC_ID));
-        if (!configSnap.exists()) {
-            await updatePortalConfig(defaultPortalConfig);
-            log.log("Seeded Portal Config");
-        }
-
-        const policySnap = await getDoc(doc(db, SETTINGS_COLLECTION, LEAVE_POLICY_DOC_ID));
-        if (!policySnap.exists()) {
-            await updateLeavePolicy(defaultLeavePolicy);
-            log.log("Seeded Leave Policy");
-        }
-
-        const sectionsSnap = await getDoc(doc(db, SETTINGS_COLLECTION, FORM_SECTIONS_DOC_ID));
-        if (!sectionsSnap.exists()) {
-            await updateFormSections(defaultSections);
-            log.log("Seeded Form Sections");
-        }
-
-        const fieldsSnap = await getDoc(doc(db, SETTINGS_COLLECTION, EDITABLE_FIELDS_DOC_ID));
-        if (!fieldsSnap.exists()) {
-            await updateEditableFields(defaultEditableFields);
-            log.log("Seeded Editable Fields");
-        }
+        const seedTasks: Promise<any>[] = [];
+        if (!sitesSnap.exists()) seedTasks.push(updateSites(defaultSites).then(() => log.log("Seeded Sites")));
+        if (!workflowsSnap.exists()) seedTasks.push(updateWorkflows(defaultWorkflows).then(() => log.log("Seeded Workflows")));
+        if (!configSnap.exists()) seedTasks.push(updatePortalConfig(defaultPortalConfig).then(() => log.log("Seeded Portal Config")));
+        if (!policySnap.exists()) seedTasks.push(updateLeavePolicy(defaultLeavePolicy).then(() => log.log("Seeded Leave Policy")));
+        if (!sectionsSnap.exists()) seedTasks.push(updateFormSections(defaultSections).then(() => log.log("Seeded Form Sections")));
+        if (!fieldsSnap.exists()) seedTasks.push(updateEditableFields(defaultEditableFields).then(() => log.log("Seeded Editable Fields")));
+        await Promise.all(seedTasks);
     } catch (error) {
         log.error("Error seeding initial data:", error);
     }

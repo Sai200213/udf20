@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { updateRoles } from '../src/services/adminService';
+import { refreshStaffClaims } from '../src/services/staffService';
 import { doc, setDoc } from 'firebase/firestore';
 import { db } from '../src/firebase/config';
 
@@ -719,11 +720,13 @@ const AdminRoleManagementPage: React.FC<AdminRoleManagementPageProps> = ({
   const saveUserOverrides = async () => {
     if (editingUserOverrides) {
       const updatedUser = editingUserOverrides;
-      setStaffUsers(prev => prev.map(s => s.id === updatedUser.id ? updatedUser : s));
       try {
         await setDoc(doc(db, 'staff_accounts', updatedUser.id), {
-          permissionOverrides: updatedUser.permissionOverrides || {}
+          permissionOverrides: updatedUser.permissionOverrides || {},
+          allowedPrefillFieldIds: updatedUser.allowedPrefillFieldIds || []
         }, { merge: true });
+        await refreshStaffClaims(updatedUser.id);
+        setStaffUsers(prev => prev.map(s => s.id === updatedUser.id ? updatedUser : s));
         onNotify(`Permission overrides updated for ${updatedUser.name} and saved to server.`, 'success');
         if (logAction) logAction('UPDATE', 'STAFF', `Updated permission overrides for staff account: ${updatedUser.name}`);
       } catch (err: any) {

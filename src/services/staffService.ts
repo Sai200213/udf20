@@ -101,3 +101,17 @@ export const resetStaffUserPassword = async (uid: string, password: string): Pro
     }
 };
 
+
+/**
+ * Calls the Cloud Function `refreshAdminClaims` to immediately sync custom claims on token. (UDF-AUD-18)
+ */
+export const refreshStaffClaims = async (targetUid: string): Promise<boolean> => {
+    try {
+        const refreshFn = httpsCallable<{ targetUid: string }, { success: boolean }>(functions, 'refreshAdminClaims');
+        const result = await refreshFn({ targetUid });
+        return result.data?.success === true;
+    } catch (error) {
+        console.warn(`[refreshStaffClaims] Failed to refresh claims for ${targetUid}:`, error);
+        return false;
+    }
+};

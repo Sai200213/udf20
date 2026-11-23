@@ -4,11 +4,15 @@ import React from 'react';
 interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'secondary' | 'danger' | 'ghost' | 'outline';
   size?: 'sm' | 'md' | 'lg';
-  children: React.ReactNode;
+  children?: React.ReactNode;
+  text?: string;
+  icon?: React.ReactNode;
 }
 
 const Button: React.FC<ButtonProps> = ({
   children,
+  text,
+  icon,
   variant = 'primary',
   size = 'md',
   className = '',
@@ -36,7 +40,8 @@ const Button: React.FC<ButtonProps> = ({
       className={`${baseStyles} ${variantStyles[variant]} ${sizeStyles[size]} ${className}`}
       {...props}
     >
-      {children}
+      {icon && <span className="mr-1.5 inline-flex items-center">{icon}</span>}
+      {children ?? text}
     </button>
   );
 };

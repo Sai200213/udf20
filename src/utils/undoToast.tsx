@@ -39,6 +39,8 @@ export function showUndoToast({
 
         <button
           onClick={async () => {
+            if ((t as any)._isUndoing) return;
+            (t as any)._isUndoing = true;
             toast.dismiss(t.id);
             try {
               if (recycleBinId) {

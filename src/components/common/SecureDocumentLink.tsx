@@ -39,7 +39,12 @@ const SecureDocumentLink: React.FC<SecureDocumentLinkProps> = ({
 
     setLoading(true);
     try {
-      const resolvedUrl = await getSecureURL(path);
+      let resolvedUrl = await getSecureURL(path);
+      if (resolvedUrl && resolvedUrl.startsWith('data:')) {
+        const res = await fetch(resolvedUrl);
+        const blob = await res.blob();
+        resolvedUrl = URL.createObjectURL(blob);
+      }
       if (resolvedUrl && isSafeUrl(resolvedUrl)) {
         window.open(resolvedUrl, '_blank', 'noopener,noreferrer');
         // Revoke temporary blob URL after 60s so new tab has rendered it without permanently leaking memory

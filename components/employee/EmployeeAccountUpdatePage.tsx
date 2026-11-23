@@ -48,11 +48,11 @@ const EmployeeAccountUpdatePage: React.FC<EmployeeAccountUpdatePageProps> = ({
   }, [selectedFieldId, editableFields]);
 
   const currentValue = useMemo(() => {
-    if (selectedFieldId) {
+    if (selectedFieldId && employeeData?.data) {
       return employeeData.data[selectedFieldId];
     }
     return undefined;
-  }, [selectedFieldId, employeeData.data]);
+  }, [selectedFieldId, employeeData?.data]);
 
   const handleFieldChange = (fieldId: string) => {
     setSelectedFieldId(fieldId);

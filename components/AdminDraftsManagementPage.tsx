@@ -1,6 +1,6 @@
 
 import React, { useState, useMemo } from 'react';
-import { DraftSubmission, Role, SubmittedFormData } from '../types';
+import { DraftSubmission, Role, SubmittedFormData, Permission } from '../types';
 import Button from './common/Button';
 import Modal from './common/Modal';
 import { Trash2, Search, FileClock, Info, LayoutDashboard, CheckCircle2 } from 'lucide-react';
@@ -61,9 +61,10 @@ const AdminDraftsManagementPage: React.FC<AdminDraftsManagementPageProps> = ({
         setIsCleaningStale(true);
         try {
             let count = 0;
-            for (const d of staleSubmittedDrafts) {
-                await deleteDraftSubmission(d.id);
-                count++;
+            for (let i = 0; i < staleSubmittedDrafts.length; i += 10) {
+                const chunk = staleSubmittedDrafts.slice(i, i + 10);
+                await Promise.all(chunk.map(d => deleteDraftSubmission(d.id)));
+                count += chunk.length;
             }
             await logSystemAction('DELETE', 'SUBMISSION', `Purged ${count} stale drafts of already-submitted personnel`);
             alert(`Cleaned up ${count} stale draft(s)!`);
@@ -91,20 +92,37 @@ const AdminDraftsManagementPage: React.FC<AdminDraftsManagementPageProps> = ({
         }
     };
 
+    const canDeleteDrafts = isSuperAdmin || Boolean(userRole?.permissions?.includes(Permission.DELETE_SUBMISSION));
+
     const getDraftName = (draft: DraftSubmission) => {
-        // Attempt to find a name in the draft data
-        const data = draft.data || {};
-        const possibleNameFields = ['firstName', 'lastName', 'name', 'applicantName', 'full_name'];
+        const src = draft.data || (draft as any).profileData || {};
+        const searchData = src.data || src;
 
-        // Check nested data if it exists (some drafts might have a 'data' key inside 'data')
-        const searchData = data.data || data;
-
-        for (const field of possibleNameFields) {
-            if (searchData[field]) return String(searchData[field]);
+        // Check canonical applicant name field UUID (UDF-AUD-93)
+        const NAME_UUID = '7debf274-baee-4bac-a137-4b4b46719874';
+        if (typeof searchData[NAME_UUID] === 'string' && searchData[NAME_UUID].trim()) {
+            return searchData[NAME_UUID].trim();
         }
 
-        // Check for common field IDs like 'field_1' etc if we had a mapping, 
-        // but for now, we'll just search for values that look like names or use the ID.
+        const possibleNameFields = [
+            'applicantName', 'fullName', 'full_name', 'name', 
+            'Full Name', 'Applicant Name', 'firstName', 'lastName'
+        ];
+
+        for (const field of possibleNameFields) {
+            if (searchData[field] && typeof searchData[field] === 'string' && searchData[field].trim()) {
+                return String(searchData[field]).trim();
+            }
+        }
+
+        if (searchData.firstName || searchData.lastName) {
+            const combined = `${searchData.firstName || ''} ${searchData.lastName || ''}`.trim();
+            if (combined) return combined;
+        }
+
+        if ((draft as any).applicantName) return String((draft as any).applicantName);
+        if ((draft as any).email) return String((draft as any).email);
+
         return 'Incomplete Applicant';
     };
 
@@ -237,15 +255,19 @@ const AdminDraftsManagementPage: React.FC<AdminDraftsManagementPageProps> = ({
                                         </span>
                                     </td>
                                     <td className="px-6 py-4 whitespace-nowrap text-right">
-                                        <Button
-                                            variant="danger"
-                                            size="sm"
-                                            onClick={() => handleDelete(draft.id)}
-                                            disabled={isDeleting === draft.id}
-                                            className="bg-red-50 text-red-600 hover:bg-red-600 hover:text-white border-red-100"
-                                        >
-                                            {isDeleting === draft.id ? 'Deleting...' : <><Trash2 size={16} className="mr-1" /> Delete</>}
-                                        </Button>
+                                        {canDeleteDrafts ? (
+                                            <Button
+                                                variant="danger"
+                                                size="sm"
+                                                onClick={() => handleDelete(draft.id)}
+                                                disabled={isDeleting === draft.id}
+                                                className="bg-red-50 text-red-600 hover:bg-red-600 hover:text-white border-red-100"
+                                            >
+                                                {isDeleting === draft.id ? 'Deleting...' : <><Trash2 size={16} className="mr-1" /> Delete</>}
+                                            </Button>
+                                        ) : (
+                                            <span className="text-xs text-gray-400 font-medium">Read Only</span>
+                                        )}
                                     </td>
                                 </tr>
                             ))

@@ -27,10 +27,11 @@ export const getPublicStats = async (): Promise<PublicStats> => {
 };
 
 export const updatePublicStats = async (): Promise<void> => {
+    // Only administrators or scheduled triggers with SETTINGS_MANAGE permission can update settings/public_stats
     try {
-        // Calculate Total Active Employees
+        // Calculate Total Active Non-Relieved Employees (UDF-AUD-162)
         const empColl = collection(db, EMPLOYEES_COLLECTION);
-        const q = query(empColl, where("isActive", "==", true));
+        const q = query(empColl, where("isActive", "==", true), where("isRelieved", "==", false));
         const snapshot = await getCountFromServer(q);
         const count = snapshot.data().count;
 
@@ -42,13 +43,11 @@ export const updatePublicStats = async (): Promise<void> => {
         await setDoc(doc(db, SETTINGS_COLLECTION, STATS_DOC_ID), stats, { merge: true });
         log.log("Public stats updated:", stats);
 
-    } catch (error) {
-        console.error("Error updating public stats:", error);
-        // Don't throw, just log. This is a background sync.
+    } catch (error: any) {
+        if (error?.code === 'permission-denied' || error?.message?.includes('permission')) {
+            log.debug("Public stats update skipped: caller lacks SETTINGS_MANAGE permissions.");
+        } else {
+            console.warn("Error updating public stats:", error);
+        }
     }
 };
-
-
-
-
-

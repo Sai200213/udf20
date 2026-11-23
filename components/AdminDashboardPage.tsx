@@ -51,6 +51,23 @@ const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
     const pendingLeavesCount = isUnassignedStaff ? 0 : stats.pendingLeaves;
     const pendingUpdatesCount = isUnassignedStaff ? 0 : stats.pendingUpdates;
     const activeEmployeesCount = isUnassignedStaff ? 0 : stats.activeEmployees;
+    const pendingResignationsCount = isUnassignedStaff ? 0 : stats.pendingResignations;
+    const pendingProfilesCount = isUnassignedStaff ? 0 : stats.pendingProfiles;
+
+    // Real-time leave breakdown computation by type (UDF-AUD-139)
+    const leavesByType = useMemo(() => {
+        if ((stats as any)?.leavesByType && Object.keys((stats as any).leavesByType).length > 0) {
+            return (stats as any).leavesByType;
+        }
+        const counts: Record<string, { approved: number; pending: number }> = {};
+        (leaveRequests || []).forEach(lr => {
+            const type = lr.leaveType || 'General Leave';
+            if (!counts[type]) counts[type] = { approved: 0, pending: 0 };
+            if (lr.status === RequestStatus.APPROVED) counts[type].approved++;
+            else if (lr.status === RequestStatus.PENDING) counts[type].pending++;
+        });
+        return counts;
+    }, [(stats as any)?.leavesByType, leaveRequests]);
 
 
     const showSubmissions = hasPermission(Permission.SUBMISSIONS_VIEW);
@@ -134,12 +151,12 @@ const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
                             className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 cursor-pointer hover:shadow-md hover:border-red-300 transition-all group"
                         >
                             <div className="flex justify-between items-start mb-4">
-                                <div className={`p-3 rounded-lg ${stats.pendingResignations > 0 ? 'bg-red-100 text-red-600' : 'bg-gray-100 text-gray-400'}`}>
+                                <div className={`p-3 rounded-lg ${pendingResignationsCount > 0 ? 'bg-red-100 text-red-600' : 'bg-gray-100 text-gray-400'}`}>
                                     <UserMinus size={24} />
                                 </div>
-                                {stats.pendingResignations > 0 && <span className="bg-red-500 text-white text-xs font-bold px-2 py-1 rounded-full">{stats.pendingResignations} Pending</span>}
+                                {pendingResignationsCount > 0 && <span className="bg-red-500 text-white text-xs font-bold px-2 py-1 rounded-full">{pendingResignationsCount} Pending</span>}
                             </div>
-                            <h3 className="text-3xl font-bold text-gray-800 mb-1">{stats.pendingResignations}</h3>
+                            <h3 className="text-3xl font-bold text-gray-800 mb-1">{pendingResignationsCount}</h3>
                             <p className="text-sm font-medium text-gray-500 group-hover:text-red-600 transition-colors">Resignation Requests</p>
                         </div>
                     )}
@@ -150,12 +167,12 @@ const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
                             className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 cursor-pointer hover:shadow-md hover:border-amber-300 transition-all group"
                         >
                             <div className="flex justify-between items-start mb-4">
-                                <div className={`p-3 rounded-lg ${stats.pendingProfiles > 0 ? 'bg-amber-100 text-amber-600' : 'bg-gray-100 text-gray-400'}`}>
+                                <div className={`p-3 rounded-lg ${pendingProfilesCount > 0 ? 'bg-amber-100 text-amber-600' : 'bg-gray-100 text-gray-400'}`}>
                                     <AlertCircle size={24} />
                                 </div>
-                                {stats.pendingProfiles > 0 && <span className="bg-amber-500 text-white text-xs font-bold px-2 py-1 rounded-full">{stats.pendingProfiles} Action Required</span>}
+                                {pendingProfilesCount > 0 && <span className="bg-amber-500 text-white text-xs font-bold px-2 py-1 rounded-full">{pendingProfilesCount} Action Required</span>}
                             </div>
-                            <h3 className="text-3xl font-bold text-gray-800 mb-1">{stats.pendingProfiles}</h3>
+                            <h3 className="text-3xl font-bold text-gray-800 mb-1">{pendingProfilesCount}</h3>
                             <p className="text-sm font-medium text-gray-500 group-hover:text-amber-600 transition-colors">Incomplete Profiles</p>
                         </div>
                     )}
@@ -230,10 +247,10 @@ const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
                                     <CalendarCheck className="mr-2 text-orange-500" size={20} /> Leave Insights
                                 </h3>
                                 <div className="space-y-3">
-                                    {Object.entries(stats.leavesByType || {}).length === 0 ? (
+                                    {Object.entries(leavesByType || {}).length === 0 ? (
                                         <p className="text-gray-400 text-sm text-center py-4">No leave data available.</p>
                                     ) : (
-                                        Object.entries(stats.leavesByType || {}).map(([type, counts]: [string, any]) => (
+                                        Object.entries(leavesByType || {}).map(([type, counts]: [string, any]) => (
                                             <div key={type} className="flex items-center text-sm">
                                                 <div className="w-32 font-medium text-gray-600 truncate" title={type}>{type}</div>
                                                 <div className="flex-1 flex h-6 rounded-md overflow-hidden bg-gray-100 mx-2">

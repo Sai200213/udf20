@@ -12,6 +12,7 @@ if (typeof window !== 'undefined' && !pdfjsLib.GlobalWorkerOptions.workerSrc) {
  */
 const dataUrlToUint8Array = (dataUrl: string): Uint8Array => {
     const base64 = dataUrl.split(',')[1];
+    if (!base64) throw new Error('Empty or invalid canvas data export');
     const binary = atob(base64);
     const len = binary.length;
     const bytes = new Uint8Array(len);
@@ -121,7 +122,12 @@ export const compressPdf = async (
                 width: unscaledViewport.width,
                 height: unscaledViewport.height
             });
+            canvas.width = 0;
+            canvas.height = 0;
+            page.cleanup();
         }
+
+        await pdfJsDoc.destroy().catch(() => {});
 
         const compressedBytes = await outputPdf.save({ useObjectStreams: true });
         const compressedSizeKb = (compressedBytes.byteLength / 1024).toFixed(1);

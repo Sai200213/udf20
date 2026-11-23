@@ -60,6 +60,7 @@ export const checkImageBlurry = (imgElement: HTMLImageElement): { score: number;
       }
     }
 
+    if (count === 0) return { score: 0, isBlurry: false };
     const mean = sum / count;
     let varianceSum = 0;
     for (let y = 1; y < height - 1; y++) {

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { FormSection, FormField, FieldType } from '../../types';
 import { createCorrectionRequest } from '../../src/services/employeeService';
 import Button from './Button';
@@ -51,6 +51,24 @@ const RequestCorrectionModal: React.FC<RequestCorrectionModalProps> = ({
     return {};
   });
   const [generalComment, setGeneralComment] = useState('');
+
+  // Sync state whenever modal is opened or initialSelectedFields updates
+  useEffect(() => {
+    if (isOpen && initialSelectedFields && initialSelectedFields.length > 0) {
+      const map: Record<string, boolean> = {};
+      const reasons: Record<string, string> = {};
+      initialSelectedFields.forEach(id => {
+        map[id] = true;
+        reasons[id] = "Please verify and correct this information (conflicts with an existing record or invalid format).";
+      });
+      setSelectedFields(map);
+      setFieldReasons(reasons);
+    } else if (isOpen && (!initialSelectedFields || initialSelectedFields.length === 0)) {
+      setSelectedFields({});
+      setFieldReasons({});
+    }
+  }, [isOpen, initialSelectedFields]);
+
   // Expiry Config States
   const [expiryMinutes, setExpiryMinutes] = useState(1440); // Default to 24 Hours (1 Day)
   const [customMinutes, setCustomMinutes] = useState('30');
@@ -113,18 +131,27 @@ const RequestCorrectionModal: React.FC<RequestCorrectionModalProps> = ({
 
   // Select/Unselect All fields in a section
   const handleSelectSectionFields = (section: FormSection, selectAll: boolean) => {
-    const fieldIds = section.fields
-      .filter(f => f.type !== FieldType.HEADER && f.type !== FieldType.INFO_TEXT)
+    const fieldIds = (section.fields || [])
+      .filter(f => f.type !== FieldType.HEADER && f.type !== FieldType.INFO_TEXT && !f.isDisabled && (f as any).fieldVisibility !== 'HIDDEN')
       .map(f => f.id);
 
     setSelectedFields(prev => {
       const copy = { ...prev };
       fieldIds.forEach(id => {
         copy[id] = selectAll;
-        if (!selectAll) delete fieldReasons[id];
       });
       return copy;
     });
+
+    if (!selectAll) {
+      setFieldReasons(prev => {
+        const copy = { ...prev };
+        fieldIds.forEach(id => {
+          delete copy[id];
+        });
+        return copy;
+      });
+    }
   };
 
   // Generate Request Link
@@ -363,8 +390,8 @@ const RequestCorrectionModal: React.FC<RequestCorrectionModalProps> = ({
               </h5>
 
               {formSections.map(sec => {
-                // Filter out non-input structural items (headers and helper texts)
-                const inputFields = sec.fields?.filter(f => f.type !== FieldType.HEADER && f.type !== FieldType.INFO_TEXT) || [];
+                // Filter out non-input structural items (headers and helper texts) as well as disabled/hidden fields (UDF-AUD-115)
+                const inputFields = sec.fields?.filter(f => f.type !== FieldType.HEADER && f.type !== FieldType.INFO_TEXT && !f.isDisabled && (f as any).fieldVisibility !== 'HIDDEN') || [];
                 if (inputFields.length === 0) return null;
 
                 const selectedInSec = inputFields.filter(f => selectedFields[f.id]);

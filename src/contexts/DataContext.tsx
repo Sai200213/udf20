@@ -219,8 +219,9 @@ export const DataProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     const [dashboardAnalytics, setDashboardAnalytics] = useState<DashboardAnalytics | null>(null);
 
     const leaveBalances = useMemo<LeaveBalance[]>(() => {
+        if (!employees || employees.length === 0) return leaveBalancesRaw;
         return employees.map(emp => {
-            const validIds = [emp.id, emp.employeeId, (emp as any).portalId, (emp as any).submissionId].filter(Boolean);
+            const validIds = [emp.id, emp.employeeId, (emp as any).portalId, (emp as any).submissionId, (emp as any).uid].filter(Boolean);
             const empLeaves = leaveRequests.filter(r => validIds.includes(r.employeeId) && r.status === 'Approved');
             
             const policyBalances: Record<string, { total: number; used: number }> = {};
@@ -237,32 +238,45 @@ export const DataProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                     const shortKey = keyMap[lt.label] || lt.typeId.toLowerCase();
                     const hasStored = emp.leaveBalance?.[shortKey] !== undefined;
                     hasExplicitBalance[lt.label] = hasStored;
+                    if (lt.typeId) hasExplicitBalance[lt.typeId] = hasStored;
                     const quota = hasStored ? emp.leaveBalance[shortKey] : lt.defaultQuota;
 
                     policyBalances[lt.label] = {
                         total: quota,
                         used: 0
                     };
+                    if (lt.typeId && lt.typeId !== lt.label) {
+                        policyBalances[lt.typeId] = {
+                            total: quota,
+                            used: 0
+                        };
+                    }
                 });
             }
 
             empLeaves.forEach(req => {
-                const labelMap: Record<string, string> = {
-                    'Casual Leave': 'Casual Leave',
-                    'Sick Leave': 'Sick Leave',
-                    'Earned Leave': 'Earned Leave',
-                    'Privilege Leave': 'Privilege Leave'
-                };
-                const leaveLabel = labelMap[req.leaveType] || req.leaveType;
-                if (!policyBalances[leaveLabel]) {
-                    policyBalances[leaveLabel] = { total: 0, used: 0 };
+                const leaveKey = req.leaveType;
+                const matchedType = leavePolicy?.leaveTypes?.find(lt => lt.typeId === leaveKey || lt.label === leaveKey);
+                const keysToUpdate = new Set<string>();
+                if (matchedType) {
+                    keysToUpdate.add(matchedType.label);
+                    if (matchedType.typeId) keysToUpdate.add(matchedType.typeId);
+                } else {
+                    keysToUpdate.add(leaveKey);
                 }
                 const [sY, sM, sD] = req.startDate.split('-').map(Number);
                 const [eY, eM, eD] = req.endDate.split('-').map(Number);
                 const startUTC = Date.UTC(sY, sM - 1, sD);
                 const endUTC = Date.UTC(eY, eM - 1, eD);
                 const days = Math.round((endUTC - startUTC) / (1000 * 3600 * 24)) + 1;
-                policyBalances[leaveLabel].used += Math.max(0, days);
+                const usedDays = Math.max(0, days);
+
+                keysToUpdate.forEach(k => {
+                    if (!policyBalances[k]) {
+                        policyBalances[k] = { total: 0, used: 0 };
+                    }
+                    policyBalances[k].used += usedDays;
+                });
             });
 
             // IMP-4: If emp.leaveBalance stored the remaining balance in Firestore,
@@ -275,7 +289,10 @@ export const DataProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
             });
 
             return {
-                employeeId: emp.employeeId,
+                employeeId: emp.employeeId || emp.id,
+                portalId: (emp as any).portalId || emp.id,
+                id: emp.id,
+                uid: (emp as any).uid || (emp as any).linkedUid || null,
                 year: new Date().getFullYear(),
                 balances: policyBalances
             };
@@ -283,7 +300,7 @@ export const DataProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }, [employees, leaveRequests, leavePolicy]);
 
     const setLeaveBalances = useCallback((val: any) => {
-        // No-op for backward compatibility
+        setLeaveBalancesRaw(val);
     }, []);
 
     const userRoleObj = useMemo(() => {
@@ -408,7 +425,11 @@ export const DataProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                 }
                 return Boolean(userRoleObj?.permissions?.includes(p));
             };
-            const hasViewScopeAll = isSuper || hasPermission(Permission.SUBMISSIONS_VIEW_SCOPE_ALL);
+            const hasViewScopeAll = isSuper || 
+                hasPermission(Permission.SUBMISSIONS_VIEW_SCOPE_ALL) ||
+                hasPermission(Permission.EMPLOYEES_VIEW_SCOPE_ALL) ||
+                hasPermission(Permission.MANAGE_SITES) ||
+                Boolean((userRoleObj?.permissions as any)?.includes('MANAGE_ALL_SITES'));
 
             // For non-super-admins and site-restricted staff, filter stats by their assigned sites
             let siteNames: string[] | undefined;

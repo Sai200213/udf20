@@ -46,7 +46,8 @@ const CareersPage: React.FC = () => {
     });
 
     const handleApply = (vacancy: Vacancy) => {
-        navigate(`/join?siteId=${vacancy.siteId}&role=${encodeURIComponent(vacancy.title)}`);
+        const role = (vacancy as any).designation || vacancy.title;
+        navigate(`/join?siteId=${encodeURIComponent(vacancy.siteId)}&role=${encodeURIComponent(role)}`);
     };
 
     if (loading) {

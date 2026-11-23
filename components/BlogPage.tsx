@@ -28,7 +28,8 @@ import SEOHead from '../src/components/common/SEOHead';
 import { getBlogPosts, BlogPost } from '../src/services/blogService';
 import { getWebsiteConfig, WebsiteServiceData } from '../src/services/websiteService';
 import { getOpenVacancies } from '../src/services/vacancyService';
-import { Vacancy } from '../types';
+import { Vacancy, UserType } from '../types';
+import { useAuth } from '../src/context/AuthContext';
 
 const getFormattedImageUrl = (url?: string) => {
     if (!url) return '';
@@ -41,6 +42,7 @@ const getFormattedImageUrl = (url?: string) => {
 
 const BlogPage: React.FC = () => {
     const navigate = useNavigate();
+    const { user } = useAuth();
     const [posts, setPosts] = useState<BlogPost[]>([]);
     const [config, setConfig] = useState<WebsiteServiceData | null>(null);
     const [vacancies, setVacancies] = useState<Vacancy[]>([]);
@@ -105,7 +107,8 @@ const BlogPage: React.FC = () => {
     };
 
     const handleApply = (vacancy: Vacancy) => {
-        navigate(`/join?siteId=${vacancy.siteId}&role=${encodeURIComponent(vacancy.title)}`);
+        const role = (vacancy as any).designation || vacancy.title;
+        navigate(`/join?siteId=${encodeURIComponent(vacancy.siteId)}&role=${encodeURIComponent(role)}`);
     };
 
 
@@ -139,7 +142,9 @@ const BlogPage: React.FC = () => {
         );
     }
 
-    const recentPosts = posts.slice(0, 3);
+    const isStaffOrAdmin = Boolean(user && (user.type === UserType.ADMIN || user.type === UserType.EMPLOYEE || (user as any).isSuperAdmin || (user as any).type === 'Staff'));
+    const visiblePosts = posts.filter(p => !p.isPrivate || isStaffOrAdmin);
+    const recentPosts = visiblePosts.slice(0, 3);
     const services = config?.services || [];
 
     return (

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Search, Filter, Link2, Copy, Check, Trash2, ShieldAlert, RotateCcw, AlertTriangle, Clock, CheckCircle2, AlertCircle } from 'lucide-react';
-import { CorrectionRequest, FormSection, Role, Permission } from '../types';
+import { CorrectionRequest, FormSection, Role, Permission, User } from '../types';
 import { getAllCorrectionRequests, revokeCorrectionRequest, deleteCorrectionRequest } from '../src/services/employeeService';
 import Button from './common/Button';
 
@@ -8,6 +8,7 @@ interface AdminCorrectionRequestsPageProps {
   sections: FormSection[];
   isSuperAdmin?: boolean;
   userRole?: Role;
+  authUser?: User | null;
   onNotify: (message: string, type?: 'success' | 'error' | 'info' | 'warning') => void;
   logAction?: (
     actionType: 'CREATE' | 'UPDATE' | 'DELETE' | 'STATUS_CHANGE' | 'APPROVAL' | 'REJECTION' | 'LOGIN' | 'LOGOUT' | 'SUBMIT' | 'EXPORT',
@@ -20,6 +21,7 @@ const AdminCorrectionRequestsPage: React.FC<AdminCorrectionRequestsPageProps> = 
   sections,
   isSuperAdmin,
   userRole,
+  authUser,
   onNotify,
   logAction
 }) => {
@@ -48,7 +50,24 @@ const AdminCorrectionRequestsPage: React.FC<AdminCorrectionRequestsPageProps> = 
     fetchRequests();
   }, []);
 
-  const hasManagePerm = isSuperAdmin || userRole?.permissions.includes(Permission.MANAGE_SUBMISSIONS);
+  const checkPerm = (p: Permission) => {
+    if (isSuperAdmin) return true;
+    if (userRole?.isDisabled === true) return false;
+    const overrides = (authUser as any)?.permissionOverrides;
+    if (overrides && overrides[p] !== undefined) {
+      return Boolean(overrides[p]);
+    }
+    return Boolean(userRole?.permissions?.includes(p));
+  };
+
+  const canRevokeCorrection = isSuperAdmin || 
+    checkPerm(Permission.SUBMISSIONS_CREATE_CORRECTION_LINK) || 
+    checkPerm(Permission.EMPLOYEES_REQUEST_CORRECTION) || 
+    checkPerm(Permission.SUBMISSIONS_APPROVE);
+
+  const canDeleteCorrection = isSuperAdmin || 
+    checkPerm(Permission.DELETE_SUBMISSION) || 
+    checkPerm(Permission.DELETE_EMPLOYEE);
 
   // Helper to translate field UUIDs to human-readable labels
   const getFieldLabel = (fieldId: string) => {
@@ -129,9 +148,9 @@ const AdminCorrectionRequestsPage: React.FC<AdminCorrectionRequestsPageProps> = 
       const computedStatus = req.status === 'pending' && isExpired ? 'expired' : req.status;
 
       const matchesSearch =
-        req.applicantName.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        req.targetId.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        req.createdBy.toLowerCase().includes(searchTerm.toLowerCase());
+        (req.applicantName || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
+        (req.targetId || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
+        (req.createdBy || 'System').toLowerCase().includes(searchTerm.toLowerCase());
 
       const matchesStatus =
         filterStatus === 'ALL' ||
@@ -309,7 +328,7 @@ const AdminCorrectionRequestsPage: React.FC<AdminCorrectionRequestsPageProps> = 
 
                       {/* Creator */}
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
-                        {req.createdBy}
+                        {req.createdBy || 'System'}
                       </td>
 
                       {/* Storage Policy */}
@@ -353,7 +372,7 @@ const AdminCorrectionRequestsPage: React.FC<AdminCorrectionRequestsPageProps> = 
                             variant="secondary"
                             size="sm"
                             onClick={() => handleRevoke(req)}
-                            disabled={!canRevokeActive || !hasManagePerm}
+                            disabled={!canRevokeActive || !canRevokeCorrection}
                             title={canRevokeActive ? "Revoke / Expire Link" : "Cannot Revoke (Already Expired/Used)"}
                             className={`bg-white ${canRevokeActive ? 'hover:bg-amber-50 hover:border-amber-200' : 'opacity-40 cursor-not-allowed'}`}
                           >
@@ -365,7 +384,7 @@ const AdminCorrectionRequestsPage: React.FC<AdminCorrectionRequestsPageProps> = 
                             variant="secondary"
                             size="sm"
                             onClick={() => handleDelete(req)}
-                            disabled={!hasManagePerm}
+                            disabled={!canDeleteCorrection}
                             title="Delete Request and Token"
                             className="bg-white hover:bg-red-50 hover:border-red-200"
                           >

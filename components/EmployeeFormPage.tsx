@@ -157,12 +157,22 @@ const clearOnboardingSession = async () => {
   sessionStorage.removeItem(SS_SAVED_DRAFT_ID);
   sessionStorage.removeItem(SS_LAST_ACTIVE);
   sessionStorage.removeItem('referralInviteId');
+  sessionStorage.removeItem('onboardingGoogleAuth');
+  sessionStorage.removeItem('isLinkingGoogle');
   localStorage.removeItem(SS_FORM_DATA);
   localStorage.removeItem(SS_CURRENT_STEP);
+  localStorage.removeItem(SS_HAS_AUTH);
+  localStorage.removeItem(SS_LINKED_UID);
   localStorage.removeItem(SS_SAVED_DRAFT_ID);
   localStorage.removeItem(SS_LAST_ACTIVE);
   localStorage.removeItem('referralInviteId');
-  await clearFileSession();
+  localStorage.removeItem('onboardingGoogleAuth');
+  localStorage.removeItem('portalType');
+  try {
+    await clearFileSession();
+  } catch (e) {
+    console.warn('Error clearing file session:', e);
+  }
 };
 
 const isFormEmpty = (data: Record<string, any>, referralInvite?: ReferralInvite | null): boolean => {
@@ -214,8 +224,18 @@ const isFormEmpty = (data: Record<string, any>, referralInvite?: ReferralInvite 
 };
 
 const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading, onBackToHome, onFormSubmit, onSaveDraft, onRetrieveDraft, onDiscardDraft, initialDraft }) => {
-  const { authUser, isSuperAdmin } = useAuth();
+  const { user } = useAuth();
+  const authUser = user;
+  const isSuperAdmin = user?.isSuperAdmin === true || (user as any)?.roleId === 'super-admin' || (user as any)?.roleId === 'role-super-admin';
   const { roles, sites, portalConfig } = useData();
+
+  const siteOptionLabels = useMemo(() => {
+    const map: Record<string, string> = {};
+    (sites || []).forEach(s => {
+      map[s.id] = s.name;
+    });
+    return map;
+  }, [sites]);
 
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [referralInvite, setReferralInvite] = useState<ReferralInvite | null>(null);
@@ -348,14 +368,53 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
       const siteParam = params.get('siteId') || params.get('site');
       const roleParam = params.get('role') || params.get('designation');
       if (siteParam || roleParam) {
+        const matchedSite = siteParam
+          ? sites.find(s => s.id === siteParam || s.name?.trim().toLowerCase() === siteParam.trim().toLowerCase())
+          : undefined;
+        const resolvedSiteId = matchedSite ? matchedSite.id : siteParam;
         setFormData(prev => {
           const next = { ...prev };
-          if (siteParam) next['siteId'] = siteParam;
-          if (roleParam) next['designation'] = roleParam;
+          if (resolvedSiteId) {
+            next['siteId'] = resolvedSiteId;
+            next['52ae217b-2602-4337-a1cd-a1f9bd36a4b0'] = resolvedSiteId;
+          }
+          if (roleParam) {
+            next['designation'] = roleParam;
+            next['db307195-cf54-4a6e-9056-f3974b050c4d'] = roleParam;
+          }
           return next;
         });
       }
     } catch (e) {}
+  }, [sites]);
+
+  // Reconcile role prefill with portal master designations when loaded
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const roleParam = params.get('role') || params.get('designation');
+      if (roleParam && portalConfig?.designations && portalConfig.designations.length > 0) {
+        const exactMatch = portalConfig.designations.find(d => d.trim().toLowerCase() === roleParam.trim().toLowerCase());
+        const bestMatch = exactMatch || portalConfig.designations.find(d =>
+          roleParam.trim().toLowerCase().includes(d.trim().toLowerCase()) ||
+          d.trim().toLowerCase().includes(roleParam.trim().toLowerCase())
+        );
+        if (bestMatch) {
+          setFormData(prev => ({
+            ...prev,
+            designation: bestMatch,
+            'db307195-cf54-4a6e-9056-f3974b050c4d': bestMatch
+          }));
+        }
+      }
+    } catch (e) {}
+  }, [portalConfig?.designations]);
+
+  // Clean up any stale or expired local storage drafts if not continuing an active session
+  useEffect(() => {
+    if (!isContinuingSession()) {
+      clearOnboardingSession().catch(() => {});
+    }
   }, []);
 
   // Ensure candidate has an active authenticated session (anonymous or existing) on mount
@@ -419,7 +478,6 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
       }
       const serialized = JSON.stringify(serializable);
       sessionStorage.setItem(SS_FORM_DATA, serialized);
-      localStorage.setItem(SS_FORM_DATA, serialized);
       updateSessionActivity();
     } catch (e) { /* quota exceeded — ignore */ }
   }, [formData]);
@@ -1073,6 +1131,18 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
                     Object.assign(cleanPrefills, referralInvite.prefillFields);
                   }
                 }
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlSite = urlParams.get('siteId') || urlParams.get('site');
+                const urlRole = urlParams.get('role') || urlParams.get('designation');
+                if (urlSite) {
+                  const matchedSite = sites.find(s => s.id === urlSite || s.name?.trim().toLowerCase() === urlSite.trim().toLowerCase());
+                  cleanPrefills[SITE_FIELD_ID] = matchedSite ? matchedSite.id : urlSite;
+                  cleanPrefills['siteId'] = cleanPrefills[SITE_FIELD_ID];
+                }
+                if (urlRole) {
+                  cleanPrefills[DESIGNATION_FIELD_ID] = urlRole;
+                  cleanPrefills['designation'] = urlRole;
+                }
                 setFormData(cleanPrefills);
                 sessionStorage.setItem(SS_FORM_DATA, JSON.stringify(cleanPrefills));
                 sessionStorage.setItem(SS_CURRENT_STEP, '0');
@@ -1486,7 +1556,8 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
 
   // Filter out disabled sections and fields AND apply role-based visibility
   const activeSections = useMemo(() => {
-    const userRole = authUser && authUser.roleId ? roles.find(r => r.id === authUser.roleId) : null;
+    const staffRoleId = authUser?.roleId || (authUser as any)?.role;
+    const userRole = staffRoleId ? roles.find(r => r.id === staffRoleId) : null;
     const fieldVisibility = userRole?.fieldVisibility || {};
 
     const rawSections = (sections && sections.length > 0) ? sections : defaultFormSections;
@@ -2042,11 +2113,11 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
     }
   }, [activeSections, validateSingleField, SITE_FIELD_ID, SUBUNIT_FIELD_ID, isSiteField, isDesignationField, isSubunitField, onSaveDraft]);
 
-  const validateStepFields = useCallback((stepIndex: number): boolean => {
+  const validateStepFields = useCallback((stepIndex: number): { isValid: boolean; errors: Record<string, string> } => {
     const errors: Record<string, string> = {};
     const currentSection = activeSections[stepIndex];
 
-    if (!currentSection) return true;
+    if (!currentSection) return { isValid: true, errors: {} };
 
     currentSection.fields.forEach(field => {
       const error = validateSingleField(field, formData[field.id]);
@@ -2056,18 +2127,19 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
     });
 
     setFormErrors(prev => ({ ...prev, ...errors }));
-    return Object.keys(errors).length === 0;
+    return { isValid: Object.keys(errors).length === 0, errors };
   }, [activeSections, validateSingleField, formData]);
 
   const handleNextStep = () => {
-    if (validateStepFields(currentStep)) {
+    const { isValid, errors } = validateStepFields(currentStep);
+    if (isValid) {
       if (currentStep < activeSections.length) {
         const nextStep = currentStep + 1;
         setCurrentStep(nextStep);
         syncDraftMilestone(nextStep);
       }
     } else {
-      const firstErrorId = Object.keys(formErrors)[0];
+      const firstErrorId = Object.keys(errors)[0];
       if (firstErrorId) {
         document.getElementById(firstErrorId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
@@ -2088,7 +2160,8 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
     // Validate ALL sections before submitting to ensure no fields were missed
     let allValid = true;
     for (let i = 0; i < activeSections.length; i++) {
-      if (!validateStepFields(i)) {
+      const { isValid } = validateStepFields(i);
+      if (!isValid) {
         allValid = false;
         setCurrentStep(i); // Go to the first section with errors
         break;
@@ -2160,6 +2233,10 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
         hashedPasswordToPass = await hashCandidatePassword(password);
       } catch (err) {
         console.error("Failed to hash password on client", err);
+        setIsSubmitting(false);
+        setShowSubmissionProgress(false);
+        setSubmissionError("Could not secure your password due to a network error. Please try submitting again.");
+        return;
       }
     }
 
@@ -2176,7 +2253,7 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
     };
     const result = await onFormSubmit(submissionData, sections, linkedUid || undefined, onProgress, (legacyClaim as any)?.legacyImportId || (legacyClaim as any)?.id || legacyClaim?.employeeId, hashedPasswordToPass);
 
-    if (result.success) {
+    if (result && result.success) {
       // Brief pause so user can see the final "done" state
       await new Promise(r => setTimeout(r, 400));
       setShowSubmissionProgress(false);
@@ -2422,10 +2499,7 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
     }
 
     // Dynamic Options Injection for Site, Sub-Unit, and Designation
-    // Build a siteId→siteName label map for display purposes
     const activeSites = sites.filter(s => s.status === 'Active');
-    const siteOptionLabels: Record<string, string> = {};
-    activeSites.forEach(s => { siteOptionLabels[s.id] = s.name; });
 
     const isSite = isSiteField(field);
     const isSubunit = isSubunitField(field);
@@ -2468,6 +2542,7 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
       onChange: handleInputChange,
       error: formErrors[field.id],
       disabled: fieldToRender.isDisabled || isSubmitting,
+      draftId: savedDraftId || undefined,
       // Pass optionLabels only for the site field dropdown
       ...(isSite ? { optionLabels: siteOptionLabels } : {}),
     };
@@ -3101,10 +3176,12 @@ const EmployeeFormPage: React.FC<EmployeeFormPageProps> = ({ sections, isLoading
                             const isStringVal = typeof val === 'string';
                             const fileName = isStringVal ? getCleanFileName(val) : (val instanceof File ? val.name : 'Document Uploaded');
                             displayValue = fileName;
+                          } else if (Array.isArray(val)) {
+                            displayValue = val.length > 0 ? val.join(', ') : 'None';
                           } else if (field.type === FieldType.CHECKBOX) {
                             displayValue = val ? 'Yes' : 'No';
-                          } else if (Array.isArray(val)) {
-                            displayValue = val.join(', ');
+                          } else if (field.id === SITE_FIELD_ID || isSiteField(field)) {
+                            displayValue = siteOptionLabels[val] || String(val);
                           } else {
                             displayValue = String(val);
                           }

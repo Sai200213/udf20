@@ -25,11 +25,12 @@ const SetupAccountPage: React.FC = () => {
             const { getGoogleCredentialSafely } = await import('../../utils/googleAuthHelper');
             const result = await getGoogleCredentialSafely();
 
-            // Link this Google Account to the Employee Record safely via Cloud Function
-            if (user && user.employeeId) {
-                                const selfLinkGoogleFn = httpsCallable(functions, 'selfLinkGoogleAccount');
+            // Link this Google Account to the Employee Record safely via Cloud Function (UDF-AUD-45)
+            const targetEmpId = user?.employeeId || (user as any)?.portalId || (user as any)?.id || (user as any)?.submissionId;
+            if (user && targetEmpId) {
+                const selfLinkGoogleFn = httpsCallable(functions, 'selfLinkGoogleAccount');
                 await selfLinkGoogleFn({
-                    employeeId: user.employeeId,
+                    employeeId: targetEmpId,
                     googleUid: result.uid,
                     email: result.email,
                     googleIdToken: result.idToken
@@ -38,6 +39,8 @@ const SetupAccountPage: React.FC = () => {
                 // Update local context
                 setUser({ ...user, authProvider: 'google', isDefaultPassword: false });
                 navigate('/employee/dashboard');
+            } else {
+                throw new Error('Employee profile ID not found. Please log in again.');
             }
         } catch (err: any) {
             console.error(err);
@@ -63,14 +66,17 @@ const SetupAccountPage: React.FC = () => {
 
         setLoading(true);
         try {
-            if (user && user.employeeId) {
+            const targetEmpId = user?.employeeId || (user as any)?.portalId || (user as any)?.id || (user as any)?.submissionId;
+            if (user && targetEmpId) {
                 // SECURITY: Hash password server-side with bcrypt via Cloud Function
-                                const setupPasswordFn = httpsCallable(functions, 'setupEmployeePassword');
-                await setupPasswordFn({ employeeId: user.employeeId, newPassword });
+                const setupPasswordFn = httpsCallable(functions, 'setupEmployeePassword');
+                await setupPasswordFn({ employeeId: targetEmpId, newPassword });
 
                 // Update local context
                 setUser({ ...user, authProvider: 'manual', isDefaultPassword: false });
                 navigate('/employee/dashboard');
+            } else {
+                throw new Error('Employee profile ID not found. Please log in again.');
             }
         } catch (err: any) {
             console.error(err);
@@ -91,7 +97,7 @@ const SetupAccountPage: React.FC = () => {
                         Account Security Setup
                     </h2>
                     <p className="text-gray-500 text-lg">
-                        Welcome, <span className="font-semibold text-gray-800">{user?.applicantName || 'Employee'}</span>!
+                        Welcome, <span className="font-semibold text-gray-800">{user?.applicantName || (user as any)?.name || 'Employee'}</span>!
                     </p>
                     <div className="mt-4 p-4 bg-yellow-50 rounded-lg text-left flex items-start">
                         <AlertTriangle className="text-yellow-600 mr-3 flex-shrink-0 mt-0.5" size={20} />

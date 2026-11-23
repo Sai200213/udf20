@@ -7,15 +7,17 @@ export const useFormBuilder = (initialSections: FormSection[] = []) => {
   const [sections, setSections] = useState<FormSection[]>(initialSections);
 
   const addSection = useCallback((name: string) => {
-    const newSection: FormSection = {
-      id: uuidv4(),
-      name,
-      order: sections.length,
-      fields: [],
-      isDisabled: false,
-    };
-    setSections(prev => [...prev, newSection]);
-  }, [sections.length]);
+    setSections(prev => [
+      ...prev,
+      {
+        id: uuidv4(),
+        name,
+        order: prev.length,
+        fields: [],
+        isDisabled: false,
+      }
+    ]);
+  }, []);
 
   const updateSectionName = useCallback((sectionId: string, newName: string) => {
     setSections(prev =>
@@ -39,12 +41,13 @@ export const useFormBuilder = (initialSections: FormSection[] = []) => {
 
   const reorderSections = useCallback((sourceIndex: number, destinationIndex: number) => {
     setSections(prev => {
-      const result = Array.from(prev);
-      const [removed] = result.splice(sourceIndex, 1);
+      // Sort first by .order so visual indices match the array being spliced (UDF-AUD-146)
+      const sorted = [...prev].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      const [removed] = sorted.splice(sourceIndex, 1);
       if (removed) {
-        result.splice(destinationIndex, 0, removed);
+        sorted.splice(destinationIndex, 0, removed);
       }
-      return result.filter((s): s is FormSection => !!s).map((s, index) => ({ ...s, order: index }));
+      return sorted.filter((s): s is FormSection => !!s).map((s, index) => ({ ...s, order: index }));
     });
   }, []);
 
@@ -112,14 +115,15 @@ export const useFormBuilder = (initialSections: FormSection[] = []) => {
     setSections(prev =>
       prev.map(section => {
         if (section.id === sectionId) {
-          const result = Array.from(section.fields);
-          const [removed] = result.splice(sourceIndex, 1);
+          // Sort first by .order so visual indices match the array being spliced (UDF-AUD-146)
+          const sorted = [...section.fields].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+          const [removed] = sorted.splice(sourceIndex, 1);
           if (removed) {
-            result.splice(destinationIndex, 0, removed);
+            sorted.splice(destinationIndex, 0, removed);
           }
           return { 
             ...section, 
-            fields: result.filter((f): f is FormField => !!f).map((f, index) => ({ ...f, order: index })) 
+            fields: sorted.filter((f): f is FormField => !!f).map((f, index) => ({ ...f, order: index })) 
           };
         }
         return section;

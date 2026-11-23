@@ -40,6 +40,7 @@ const BlogsPage: React.FC = () => {
     const { postId } = useParams<{ postId: string }>();
     const { user } = useAuth();
     const isEmployee = user && user.type === UserType.EMPLOYEE;
+    const isStaff = Boolean(user && (user.type === UserType.ADMIN || (user as any).isSuperAdmin || (user as any).type === 'Staff'));
 
     const [posts, setPosts] = useState<BlogPost[]>([]);
     const [vacancies, setVacancies] = useState<Vacancy[]>([]);
@@ -138,16 +139,21 @@ const BlogsPage: React.FC = () => {
     }, [vacancies]);
 
     const visiblePosts = React.useMemo(() => {
-        return posts.filter(post => !post.isPrivate || isEmployee);
-    }, [posts, isEmployee]);
+        return posts.filter(post => !post.isPrivate || isEmployee || isStaff);
+    }, [posts, isEmployee, isStaff]);
 
     const filteredPosts = React.useMemo(() => {
+        const query = searchQuery.trim().toLowerCase();
         const filtered = visiblePosts.filter(post => {
             const matchesCategory = selectedCategory === 'All' || post.category === selectedCategory;
-            const matchesSearch = post.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                                  post.excerpt.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                                  post.content.toLowerCase().includes(searchQuery.toLowerCase());
-            return matchesCategory && matchesSearch;
+            if (!matchesCategory) return false;
+            if (!query) return true;
+
+            const matchesTitle = post.title?.toLowerCase().includes(query);
+            const matchesCategoryName = post.category?.toLowerCase().includes(query);
+            const matchesExcerpt = post.excerpt?.toLowerCase().includes(query);
+
+            return matchesTitle || matchesCategoryName || matchesExcerpt;
         });
 
         // Pinned posts sort to the top
@@ -163,7 +169,8 @@ const BlogsPage: React.FC = () => {
     };
 
     const handleApply = (vacancy: Vacancy) => {
-        navigate(`/join?siteId=${vacancy.siteId}&role=${encodeURIComponent(vacancy.title)}`);
+        const role = (vacancy as any).designation || vacancy.title;
+        navigate(`/join?siteId=${encodeURIComponent(vacancy.siteId)}&role=${encodeURIComponent(role)}`);
     };
 
     const categories = React.useMemo(() => {

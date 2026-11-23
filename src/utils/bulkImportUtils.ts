@@ -591,8 +591,8 @@ export const checkForDatabaseDuplicates = async (
     // Chunked queries by phone number
     for (const chunkPhones of chunk(csvPhones, 30)) {
         if (chunkPhones.length > 0) {
-            empQueries.push(getDocs(query(collection(db, EMPLOYEES_COLLECTION), where("profileData.personalDetails.phoneNumber", "in", chunkPhones))));
-            subQueries.push(getDocs(query(collection(db, SUBMISSIONS_COLLECTION), where("formData.personalDetails.phoneNumber", "in", chunkPhones))));
+            empQueries.push(getDocs(query(collection(db, EMPLOYEES_COLLECTION), where("phoneNumber", "in", chunkPhones))));
+            subQueries.push(getDocs(query(collection(db, SUBMISSIONS_COLLECTION), where("phoneNumber", "in", chunkPhones))));
         }
     }
 
@@ -622,8 +622,9 @@ export const checkForDatabaseDuplicates = async (
             const empId = String(d.employeeId || "").trim();
             if (empId) empById.set(empId, docSnap.id);
 
-            const phone = String(d.profileData?.personalDetails?.phoneNumber || d.data?.[phoneFieldId || ''] || d.profileData?.[phoneFieldId || ''] || "").trim();
+            const phone = String(d.phoneNumber || d.phone || d.profileData?.phoneNumber || d.profileData?.personalDetails?.phoneNumber || d.data?.[phoneFieldId || ''] || d.profileData?.[phoneFieldId || ''] || "").trim();
             if (phone) empByPhone.set(phone, docSnap.id);
+            if (d.phoneNumber) empByPhone.set(String(d.phoneNumber).trim(), docSnap.id);
 
             const aadhar = String(d.data?.[aadharFieldId] || d.profileData?.[aadharFieldId] || "").trim();
             if (aadhar) empByAadhar.set(aadhar, docSnap.id);
@@ -641,8 +642,9 @@ export const checkForDatabaseDuplicates = async (
             const empId = String(d.employeeId || "").trim();
             if (empId) subById.set(empId, docSnap.id);
 
-            const phone = String(d.formData?.personalDetails?.phoneNumber || d.data?.[phoneFieldId || ''] || d.formData?.[phoneFieldId || ''] || "").trim();
+            const phone = String(d.phoneNumber || d.phone || d.formData?.phoneNumber || d.formData?.personalDetails?.phoneNumber || d.data?.[phoneFieldId || ''] || d.formData?.[phoneFieldId || ''] || "").trim();
             if (phone) subByPhone.set(phone, docSnap.id);
+            if (d.phoneNumber) subByPhone.set(String(d.phoneNumber).trim(), docSnap.id);
 
             const aadhar = String(d.data?.[aadharFieldId] || d.formData?.[aadharFieldId] || "").trim();
             if (aadhar) subByAadhar.set(aadhar, docSnap.id);
@@ -795,7 +797,7 @@ export const bulkImportEmployees = async (
         >(functions, 'bulkImportEmployeesServer');
         const res = await bulkImportFn({
             rows,
-            options: { generateIds, overwriteMode, idPrefix }
+            options: { generateIds, overwriteMode, idPrefix, importMode, defaultStatus }
         });
         if (res.data && res.data.success) {
             return res.data;

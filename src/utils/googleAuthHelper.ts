@@ -11,9 +11,11 @@ import {
     setPersistence,
     inMemoryPersistence
 } from 'firebase/auth';
-import { initializeApp, getApp } from 'firebase/app';
+import { initializeApp, getApp, deleteApp } from 'firebase/app';
 import { auth } from '../firebase/config';
 import log from './logger';
+const GOOGLE_CLIENT_ID = (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID || '1020534793994-rgenpapsrvjdbt2r6hicnkolfd28rdup.apps.googleusercontent.com';
+
 
 /**
  * Creates lazy-loaded secondary Firebase Auth instance so we can pop up
@@ -45,7 +47,7 @@ export const getGoogleCredentialSafely = async (): Promise<SafeGoogleResult> => 
     if (Capacitor.isNativePlatform()) {
         try {
             await GoogleAuth.initialize({
-                clientId: '1020534793994-rgenpapsrvjdbt2r6hicnkolfd28rdup.apps.googleusercontent.com',
+                clientId: GOOGLE_CLIENT_ID,
                 scopes: ['profile', 'email'],
             });
             const result = await GoogleAuth.signIn();
@@ -55,9 +57,14 @@ export const getGoogleCredentialSafely = async (): Promise<SafeGoogleResult> => 
             const secAuth = getSecondaryAuth();
             await setPersistence(secAuth, inMemoryPersistence);
             const userCred = await signInWithCredential(secAuth, credential);
+            if (!userCred.user.email) throw new Error('Google account did not return an email address.');
             const idToken = await userCred.user.getIdToken();
-            const res = { uid: userCred.user.uid, email: userCred.user.email!, idToken };
+            const res = { uid: userCred.user.uid, email: userCred.user.email, idToken };
             await secAuth.signOut();
+            try {
+                const secApp = getApp('GoogleLinkerApp');
+                await deleteApp(secApp);
+            } catch {}
             return res;
         } catch (error: any) {
             log.error('Native Safe Google error:', error);
@@ -70,9 +77,14 @@ export const getGoogleCredentialSafely = async (): Promise<SafeGoogleResult> => 
             const provider = new GoogleAuthProvider();
             provider.setCustomParameters({ prompt: 'select_account' });
             const userCred = await signInWithPopup(secAuth, provider);
+            if (!userCred.user.email) throw new Error('Google account did not return an email address.');
             const idToken = await userCred.user.getIdToken();
-            const res = { uid: userCred.user.uid, email: userCred.user.email!, idToken };
+            const res = { uid: userCred.user.uid, email: userCred.user.email, idToken };
             await secAuth.signOut();
+            try {
+                const secApp = getApp('GoogleLinkerApp');
+                await deleteApp(secApp);
+            } catch {}
             return res;
         } catch (error: any) {
             log.error('Web Safe Google error:', error);
@@ -107,7 +119,7 @@ const nativeGoogleSignIn = async (): Promise<UserCredential> => {
     try {
         // Initialize the plugin with the Web Client ID
         await GoogleAuth.initialize({
-            clientId: '1020534793994-rgenpapsrvjdbt2r6hicnkolfd28rdup.apps.googleusercontent.com',
+            clientId: GOOGLE_CLIENT_ID,
             scopes: ['profile', 'email'],
         });
 
@@ -154,7 +166,7 @@ export const googleSignInForOnboarding = async () => {
     if (Capacitor.isNativePlatform()) {
         try {
             await GoogleAuth.initialize({
-                clientId: '1020534793994-rgenpapsrvjdbt2r6hicnkolfd28rdup.apps.googleusercontent.com',
+                clientId: GOOGLE_CLIENT_ID,
                 scopes: ['profile', 'email'],
             });
             const result = await GoogleAuth.signIn();

@@ -5,22 +5,24 @@ import { getVacancies, createVacancy, updateVacancy, deleteVacancy } from '../sr
 import { updateSiteDetails } from '../src/services/siteService';
 import { defaultFormSections } from '../src/constants/defaults';
 import { MapPin, Phone, ExternalLink, Plus, Edit2, Trash2, Save, X, Briefcase, Building, AlertCircle } from 'lucide-react';
+import { AppView } from '../App';
 
 interface AdminVacancyManagerProps {
     userRole?: Role;
     isSuperAdmin?: boolean;
-    navigateTo?: (view: any) => void;
+    navigateTo?: (view: AppView) => void;
 }
 
 const AdminVacancyManager: React.FC<AdminVacancyManagerProps> = ({ userRole, isSuperAdmin = false, navigateTo }) => {
-    const { sites, allowedSiteIds, authUser, sections, portalConfig } = useData();
+    const { sites, allowedSiteIds, user, sections, portalConfig } = useData();
     const [selectedSiteId, setSelectedSiteId] = useState<string | null>(null);
     const [siteVacancies, setSiteVacancies] = useState<Vacancy[]>([]);
 
     // Granular Permissions
     const hasPermission = (p: Permission) => {
         if (isSuperAdmin) return true;
-        const userOverrides = (authUser as any)?.permissionOverrides;
+        if (userRole?.isDisabled) return false;
+        const userOverrides = (user as any)?.permissionOverrides;
         if (userOverrides && userOverrides[p] !== undefined) {
             return !!userOverrides[p];
         }
@@ -57,9 +59,9 @@ const AdminVacancyManager: React.FC<AdminVacancyManagerProps> = ({ userRole, isS
         }
 
         // PRIORITY 2: Check Form Builder "Dependent Options" (optionsMap)
-        // The keys in optionsMap are Site Names (e.g. "CAPGEMINI")
+        // The keys in optionsMap can be Site IDs or Site Names (e.g. "CAPGEMINI")
         if (activeSite && designationField?.optionsMap) {
-            const siteSpecificOptions = designationField.optionsMap[activeSite.name];
+            const siteSpecificOptions = designationField.optionsMap[activeSite.id] || designationField.optionsMap[activeSite.name];
             if (siteSpecificOptions && siteSpecificOptions.length > 0) {
                 console.log(`DEBUG: Using Form Builder mapping for ${activeSite.name}:`, siteSpecificOptions);
                 return siteSpecificOptions;
@@ -140,6 +142,15 @@ const AdminVacancyManager: React.FC<AdminVacancyManagerProps> = ({ userRole, isS
         const site = sites.find(s => s.id === selectedSiteId);
         if (!site) return;
 
+        if (!vacancyForm.title || !vacancyForm.title.trim()) {
+            alert("Please enter a valid job title or select a designation.");
+            return;
+        }
+        if (!vacancyForm.openingsCount || Number(vacancyForm.openingsCount) < 1) {
+            alert("Please specify at least 1 opening.");
+            return;
+        }
+
         try {
             const payload = {
                 ...vacancyForm,
@@ -171,17 +182,19 @@ const AdminVacancyManager: React.FC<AdminVacancyManagerProps> = ({ userRole, isS
             try {
                 const { moveToRecycleBin } = await import('../src/services/recycleBinService');
                 const { showUndoToast } = await import('../src/utils/undoToast');
+                const adminUid = (user as any)?.uid || user?.id || 'admin';
+                const adminName = (user as any)?.displayName || user?.name || user?.email || 'Admin';
                 const binId = await moveToRecycleBin({
                     itemType: 'VACANCY',
                     name: `${vacToDelete.title} (${vacToDelete.siteName || 'Site'})`,
                     originalId: vacToDelete.id,
                     originalCollection: 'vacancies',
                     data: vacToDelete,
-                    deletedByUid: authUser?.uid || 'user',
-                    deletedByName: authUser?.displayName || authUser?.email || 'Admin',
+                    deletedByUid: adminUid,
+                    deletedByName: adminName,
                     metadata: { siteId: vacToDelete.siteId, siteName: vacToDelete.siteName }
                 });
-                await deleteVacancy(id);
+                await deleteVacancy(id, adminUid, adminName);
                 loadVacancies(selectedSiteId!);
                 showUndoToast({
                     message: `Vacancy "${vacToDelete.title}" moved to Recycle Bin`,
@@ -209,7 +222,7 @@ const AdminVacancyManager: React.FC<AdminVacancyManagerProps> = ({ userRole, isS
                     </div>
                     {navigateTo && (
                         <button
-                            onClick={() => navigateTo('ADMIN_PORTAL_SITE_MANAGEMENT' as any)}
+                            onClick={() => navigateTo(AppView.ADMIN_PORTAL_SITE_MANAGEMENT)}
                             className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors shadow-xs"
                         >
                             <Building size={16} /> Manage Sites
@@ -228,7 +241,7 @@ const AdminVacancyManager: React.FC<AdminVacancyManagerProps> = ({ userRole, isS
                         </p>
                         {navigateTo && (
                             <button
-                                onClick={() => navigateTo('ADMIN_PORTAL_SITE_MANAGEMENT' as any)}
+                                onClick={() => navigateTo(AppView.ADMIN_PORTAL_SITE_MANAGEMENT)}
                                 className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold px-5 py-2.5 rounded-xl text-sm transition-all shadow-sm hover:shadow-md"
                             >
                                 <Plus size={18} /> Create First Site in Site Management
@@ -318,7 +331,7 @@ const AdminVacancyManager: React.FC<AdminVacancyManagerProps> = ({ userRole, isS
                             />
                         ) : (
                             activeSite?.googleMapsLink ? (
-                                <a href={activeSite.googleMapsLink} target="_blank" rel="noreferrer" className="text-blue-600 text-sm flex items-center hover:underline">
+                                <a href={/^https?:\/\//i.test(activeSite.googleMapsLink) ? activeSite.googleMapsLink : '#'} target="_blank" rel="noopener noreferrer" className="text-blue-600 text-sm flex items-center hover:underline">
                                     <MapPin size={14} className="mr-1" /> View on Map
                                 </a>
                             ) : <p className="text-sm text-gray-400">No link set</p>

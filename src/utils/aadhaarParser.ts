@@ -59,17 +59,28 @@ export const parseAadhaarText = (text: string): AadhaarDetails => {
     const details: AadhaarDetails = {};
 
     // 1. Aadhaar Number (XXXX XXXX XXXX)
-    const aadhaarRegex = /\b\d{4}\s\d{4}\s\d{4}\b/g;
-    const aadhaarMatches = text.match(aadhaarRegex);
+    // Strip 16-digit Virtual ID lines first so they are not mistaken for Aadhaar
+    const textWithoutVid = text.replace(/VID\s*[:\-]?\s*\d{4}\s+\d{4}\s+\d{4}\s+\d{4}/gi, '');
+    const aadhaarRegex = /\b[2-9]\d{3}\s\d{4}\s\d{4}\b/g;
+    const aadhaarMatches = textWithoutVid.match(aadhaarRegex) || text.match(/\b[2-9]\d{3}\s\d{4}\s\d{4}\b/g);
     if (aadhaarMatches) {
         details.aadhaarNo = aadhaarMatches[0].replace(/\s/g, '');
     }
 
     // 2. Date of Birth (DOB: DD/MM/YYYY or Year of Birth: YYYY)
-    const dobRegex = /DOB\s*:\s*(\d{2}\/\d{2}\/\d{4})|Date of Birth\s*:\s*(\d{2}\/\d{2}\/\d{4})/i;
+    const dobRegex = /(?:DOB|Date of Birth)\s*[:\-]?\s*(\d{2}\/\d{2}\/\d{4}|\d{4}-\d{2}-\d{2})|(?:Year of Birth|YOB)\s*[:\-]?\s*(\d{4})/i;
     const dobMatch = text.match(dobRegex);
     if (dobMatch) {
-        details.dob = dobMatch[1] || dobMatch[2];
+        if (dobMatch[1]) {
+            if (dobMatch[1].includes('-')) {
+                const [y, m, d] = dobMatch[1].split('-');
+                details.dob = `${d}/${m}/${y}`;
+            } else {
+                details.dob = dobMatch[1];
+            }
+        } else if (dobMatch[2]) {
+            details.dob = `01/01/${dobMatch[2]}`;
+        }
     }
 
     // 3. Gender (MALE/FEMALE)
@@ -89,7 +100,7 @@ export const parseAadhaarText = (text: string): AadhaarDetails => {
     // 5. Relation (Father/Spouse) logic
     // Updated Regex to handle spaces like "S / O"
     // Also correctly terminate on Newline, DOB literal, Address literal, or any Digits if commas are missing
-    const relationRegex = /(?:S\s*\/\s*O|D\s*\/\s*O|W\s*\/\s*O|C\s*\/\s*O)[\s:]+([a-zA-Z \.]+?)(?:,|Address|$|\n|DOB|[0-9])/i;
+    const relationRegex = /(?:S\s*\/\s*O|D\s*\/\s*O|W\s*\/\s*O|C\s*\/\s*O)[\s:]+([a-zA-Z\s\.\-']+?)(?:,|Address|$|\n|DOB|[0-9])/i;
     const relationMatch = text.match(relationRegex);
 
     if (relationMatch) {

@@ -62,7 +62,7 @@ const AdminLoginPage: React.FC<AdminLoginPageProps> = (props) => {
 
                 <div className="flex items-center justify-between mt-4">
                     <div className="text-sm">
-                        <button type="button" onClick={() => setShowResetModal(true)} className="font-medium text-blue-600 hover:text-blue-500">
+                        <button type="button" onClick={() => { setResetStatus('idle'); setResetEmail(''); setShowResetModal(true); }} className="font-medium text-blue-600 hover:text-blue-500">
                             Forgot your password?
                         </button>
                     </div>
@@ -101,7 +101,7 @@ const AdminLoginPage: React.FC<AdminLoginPageProps> = (props) => {
                             {resetStatus === 'success' ? (
                                 <div className="text-center">
                                     <p className="text-green-600 mb-4">Password reset email sent! Check your inbox.</p>
-                                    <Button onClick={() => setShowResetModal(false)} variant="primary" size="sm">Close</Button>
+                                    <Button onClick={() => { setShowResetModal(false); setResetStatus('idle'); setResetEmail(''); }} variant="primary" size="sm">Close</Button>
                                 </div>
                             ) : (
                                 <form onSubmit={handlePasswordReset} className="space-y-4">
@@ -115,7 +115,7 @@ const AdminLoginPage: React.FC<AdminLoginPageProps> = (props) => {
                                     />
                                     {resetStatus === 'error' && <p className="text-red-500 text-sm">Failed to send email. Check if the address is correct.</p>}
                                     <div className="flex justify-end space-x-2">
-                                        <Button type="button" onClick={() => setShowResetModal(false)} variant="secondary" size="sm">Cancel</Button>
+                                        <Button type="button" onClick={() => { setShowResetModal(false); setResetStatus('idle'); setResetEmail(''); }} variant="secondary" size="sm">Cancel</Button>
                                         <Button type="submit" disabled={resetStatus === 'loading'} variant="primary" size="sm">
                                             {resetStatus === 'loading' ? 'Sending...' : 'Send Link'}
                                         </Button>

@@ -142,6 +142,8 @@ function doPost(e) {
     if (data.action === 'restore_employee') return moveFolderAction(data.employeeName, data.uniqueId, FOLDERS.PENDING, data.folderName);
     if (data.action === 'permanent_delete_employee') return permanentDeleteAction(data.employeeName, data.uniqueId, data.folderName);
     if (data.action === 'block_employee') return moveFolderAction(data.employeeName, data.uniqueId, FOLDERS.BLOCKED, data.folderName);
+    if (data.action === 'relieve_employee') return moveFolderAction(data.employeeName, data.uniqueId, FOLDERS.RELIEVED, data.folderName);
+    if (data.action === 'rejoin_employee') return moveFolderAction(data.employeeName, data.uniqueId, FOLDERS.ACTIVE, data.folderName);
     if (data.action === 'unblock_employee') return moveFolderAction(data.employeeName, data.uniqueId, FOLDERS.ACTIVE, data.folderName);
     
     if (data.base64) {

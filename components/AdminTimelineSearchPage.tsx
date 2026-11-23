@@ -6,9 +6,10 @@ import { searchAllEmployees } from '../src/services/employeeService';
 
 interface AdminTimelineSearchPageProps {
     onViewTimeline: (employeeId: string) => void;
+    allowedSiteIds?: string[];
 }
 
-const AdminTimelineSearchPage: React.FC<AdminTimelineSearchPageProps> = ({ onViewTimeline }) => {
+const AdminTimelineSearchPage: React.FC<AdminTimelineSearchPageProps> = ({ onViewTimeline, allowedSiteIds }) => {
     const [searchTerm, setSearchTerm] = useState('');
     const [results, setResults] = useState<any[]>([]);
     const [loading, setLoading] = useState(false);
@@ -21,7 +22,7 @@ const AdminTimelineSearchPage: React.FC<AdminTimelineSearchPageProps> = ({ onVie
         setLoading(true);
         setHasSearched(true);
         try {
-            const data = await searchAllEmployees(searchTerm);
+            const data = await searchAllEmployees(searchTerm, allowedSiteIds);
             setResults(data);
         } catch (error) {
             console.error("Search failed:", error);
@@ -113,7 +114,10 @@ const AdminTimelineSearchPage: React.FC<AdminTimelineSearchPageProps> = ({ onVie
                                 </div>
                                 <Button
                                     text="View Timeline"
-                                    onClick={() => onViewTimeline(result.employeeId || result.id)}
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        onViewTimeline(result.employeeId || result.id);
+                                    }}
                                     variant="secondary"
                                     icon={<Clock size={16} />}
                                     className="sm:opacity-90 hover:opacity-100 transition-opacity shadow-sm"

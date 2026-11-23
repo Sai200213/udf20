@@ -114,30 +114,48 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
 
     // Realtime Subscriptions
     useEffect(() => {
-        setLoadingComplaints(true);
-        const unsubscribeComplaints = subscribeToComplaints((items) => {
-            setComplaints(items);
+        let unsubscribeComplaints = () => {};
+        if (canViewGrievances) {
+            setLoadingComplaints(true);
+            unsubscribeComplaints = subscribeToComplaints((items) => {
+                setComplaints(items);
+                setLoadingComplaints(false);
+            });
+        } else {
+            setComplaints([]);
             setLoadingComplaints(false);
-        });
+        }
 
-        setLoadingRewards(true);
-        const unsubscribeRewards = subscribeToRewardRedemptions((items) => {
-            setRedemptions(items);
+        let unsubscribeRewards = () => {};
+        if (canViewRewards) {
+            setLoadingRewards(true);
+            unsubscribeRewards = subscribeToRewardRedemptions((items) => {
+                setRedemptions(items);
+                setLoadingRewards(false);
+            });
+        } else {
+            setRedemptions([]);
             setLoadingRewards(false);
-        });
+        }
 
-        setLoadingInquiries(true);
-        const unsubscribeInquiries = subscribeToContactInquiries((items) => {
-            setInquiries(items);
+        let unsubscribeInquiries = () => {};
+        if (canViewInquiries) {
+            setLoadingInquiries(true);
+            unsubscribeInquiries = subscribeToContactInquiries((items) => {
+                setInquiries(items);
+                setLoadingInquiries(false);
+            });
+        } else {
+            setInquiries([]);
             setLoadingInquiries(false);
-        });
+        }
 
         return () => {
             unsubscribeComplaints();
             unsubscribeRewards();
             unsubscribeInquiries();
         };
-    }, []);
+    }, [canViewGrievances, canViewRewards, canViewInquiries]);
 
     // Helper: format timestamp
     const formatTime = (ts: any) => {
@@ -178,6 +196,10 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
     const filteredRewards = useMemo(() => {
         if (!canViewRewards) return [];
         return redemptions.filter(r => {
+            // Site Scope Check (UDF-AUD-275)
+            if (!isSuperAdmin && allowedSiteIds && allowedSiteIds.length > 0) {
+                if ((r as any).siteId && !allowedSiteIds.includes((r as any).siteId)) return false;
+            }
             const matchesSearch = 
                 (r.userName || '').toLowerCase().includes(rewardSearch.toLowerCase()) ||
                 (r.userId || '').toLowerCase().includes(rewardSearch.toLowerCase()) ||
@@ -185,30 +207,31 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
             const matchesStatus = rewardFilterStatus === 'all' || r.status === rewardFilterStatus;
             return matchesSearch && matchesStatus;
         });
-    }, [redemptions, rewardSearch, rewardFilterStatus, canViewRewards]);
+    }, [redemptions, rewardSearch, rewardFilterStatus, canViewRewards, isSuperAdmin, allowedSiteIds]);
 
-    // Grievance KPI Stats
+    // Grievance KPI Stats (Site-Scoped, UDF-AUD-59)
     const grievanceStats = useMemo(() => {
         return {
-            total: complaints.length,
-            pending: complaints.filter(c => c.status === 'pending').length,
-            inReview: complaints.filter(c => c.status === 'in-review').length,
-            resolved: complaints.filter(c => c.status === 'resolved').length
+            total: filteredComplaints.length,
+            pending: filteredComplaints.filter(c => c.status === 'pending').length,
+            inReview: filteredComplaints.filter(c => c.status === 'in-review').length,
+            resolved: filteredComplaints.filter(c => c.status === 'resolved' || c.status === 'dismissed').length
         };
-    }, [complaints]);
+    }, [filteredComplaints]);
 
-    // Reward KPI Stats
+    // Reward KPI Stats (Site-Scoped, UDF-AUD-59)
     const rewardStats = useMemo(() => {
         return {
-            total: redemptions.length,
-            pending: redemptions.filter(r => r.status === 'pending').length,
-            fulfilled: redemptions.filter(r => r.status === 'fulfilled').length,
-            totalPoints: redemptions.reduce((acc, curr) => acc + (curr.pointsSpent || 0), 0)
+            total: filteredRewards.length,
+            pending: filteredRewards.filter(r => r.status === 'pending').length,
+            fulfilled: filteredRewards.filter(r => r.status === 'fulfilled').length,
+            totalPoints: filteredRewards.reduce((acc, curr) => acc + (curr.pointsSpent || 0), 0)
         };
-    }, [redemptions]);
+    }, [filteredRewards]);
 
     // Filtered Inquiries
     const filteredInquiries = useMemo(() => {
+        if (!canViewInquiries) return [];
         return inquiries.filter(item => {
             const matchesSearch = 
                 (item.name || '').toLowerCase().includes(inquirySearch.toLowerCase()) ||
@@ -219,7 +242,7 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
             const matchesStatus = inquiryFilterStatus === 'all' || (item.status || 'new') === inquiryFilterStatus;
             return matchesSearch && matchesStatus;
         });
-    }, [inquiries, inquirySearch, inquiryFilterStatus]);
+    }, [inquiries, inquirySearch, inquiryFilterStatus, canViewInquiries]);
 
     // Inquiry KPI Stats
     const inquiryStats = useMemo(() => {
@@ -241,6 +264,11 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
     // Save inquiry update
     const handleSaveInquiry = async () => {
         if (!selectedInquiry) return;
+        const canManageInquiries = isSuperAdmin || hasPermission(Permission.MANAGE_SYSTEM);
+        if (!canManageInquiries) {
+            if (onNotify) onNotify('You do not have permission to modify business inquiries', 'error');
+            return;
+        }
         setIsSavingInquiry(true);
         try {
             const adminName = authUser?.displayName || authUser?.name || 'Admin';
@@ -266,6 +294,11 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
 
     // Delete inquiry
     const handleDeleteInquiry = async (id: string, name: string) => {
+        const canManageInquiries = isSuperAdmin || hasPermission(Permission.MANAGE_SYSTEM);
+        if (!canManageInquiries) {
+            if (onNotify) onNotify('You do not have permission to delete business inquiries', 'error');
+            return;
+        }
         if (!window.confirm(`Are you sure you want to delete inquiry from "${name}"? This action cannot be undone.`)) return;
         try {
             const ok = await deleteContactInquiry(id);
@@ -291,6 +324,10 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
     // Save complaint status update
     const handleSaveComplaint = async () => {
         if (!selectedComplaint) return;
+        if (!canResolveGrievances) {
+            if (onNotify) onNotify('You do not have permission to resolve grievances', 'error');
+            return;
+        }
         setIsSavingComplaint(true);
         try {
             const adminName = authUser?.displayName || authUser?.name || 'HR Admin';
@@ -316,6 +353,10 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
 
     // Delete complaint
     const handleDeleteComplaint = async (id: string) => {
+        if (!canDeleteGrievances) {
+            if (onNotify) onNotify('You do not have permission to delete grievances', 'error');
+            return;
+        }
         if (!window.confirm('Are you sure you want to delete this grievance record? This action cannot be undone.')) return;
         try {
             const ok = await deleteComplaint(id);
@@ -324,8 +365,9 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
             } else {
                 if (onNotify) onNotify('Failed to delete grievance', 'error');
             }
-        } catch (err) {
+        } catch (err: any) {
             console.error('Error deleting complaint:', err);
+            if (onNotify) onNotify(err?.message || 'Delete failed', 'error');
         }
     };
 
@@ -339,6 +381,10 @@ const AdminGrievancesPage: React.FC<AdminGrievancesPageProps> = ({
     // Save reward fulfillment
     const handleSaveReward = async () => {
         if (!selectedReward) return;
+        if (!canManageRewards) {
+            if (onNotify) onNotify('You do not have permission to fulfill rewards', 'error');
+            return;
+        }
         setIsSavingReward(true);
         try {
             const adminName = authUser?.displayName || authUser?.name || 'HR Admin';

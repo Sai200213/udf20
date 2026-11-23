@@ -107,9 +107,7 @@ const EmployeeEngagementHub: React.FC<EmployeeEngagementHubProps> = ({ authUser,
             const awarded = res.data?.pointsEarned ?? (isCorrect ? awardedPoints : 0);
 
             const docRef = doc(db, 'user_engagement', userId);
-            const { points: _omitPoints, referralCount: _omitRef, ...safeStreak } = (streak || { userId, userName, streakCount: 1, lastVisitDate: today }) as any;
             const updated = {
-                ...safeStreak,
                 lastQuizDate: today,
                 lastQuizOption: quizAnswer,
                 lastQuizCorrect: isCorrect
@@ -121,19 +119,22 @@ const EmployeeEngagementHub: React.FC<EmployeeEngagementHubProps> = ({ authUser,
         }
     };
 
-    // Payday Countdown Calculator
+    // Payday Countdown Calculator (UDF-AUD-155)
     const daysUntilPayday = useMemo(() => {
-        const today = new Date();
-        const year = today.getFullYear();
-        const month = today.getMonth();
-        // Payday is the 7th of every month
-        let payday = new Date(year, month, 7);
-        if (today.getDate() > 7) {
-            payday = new Date(year, month + 1, 7);
+        const now = new Date();
+        const todayDate = now.getDate();
+        if (todayDate === 7) return 0; // Today is Payday!
+
+        const year = now.getFullYear();
+        const month = now.getMonth();
+        let targetPayday = new Date(year, month, 7, 23, 59, 59);
+        if (todayDate > 7) {
+            targetPayday = new Date(year, month + 1, 7, 23, 59, 59);
         }
-        const diffTime = payday.getTime() - today.getTime();
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-        return diffDays;
+        const todayMidnight = new Date(year, month, todayDate);
+        const targetMidnight = new Date(targetPayday.getFullYear(), targetPayday.getMonth(), 7);
+        const diffTime = targetMidnight.getTime() - todayMidnight.getTime();
+        return Math.max(0, Math.round(diffTime / (1000 * 60 * 60 * 24)));
     }, []);
 
     // Handle complaint submission

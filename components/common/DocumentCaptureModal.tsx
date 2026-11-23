@@ -116,15 +116,19 @@ export const DocumentCaptureModal: React.FC<DocumentCaptureModalProps> = ({
 
   // Dynamically generate the pre-rotated image when imageSrc or rotation changes
   useEffect(() => {
+    let active = true;
     if (imageSrc) {
       rotateImage(imageSrc, rotation).then((res) => {
-        if (isSafeUrl(res)) {
+        if (active && isSafeUrl(res)) {
           setRotatedImageSrc(res);
         }
       });
     } else {
       setRotatedImageSrc(null);
     }
+    return () => {
+      active = false;
+    };
   }, [imageSrc, rotation]);
 
   // Determine Aspect Ratio based on document type
@@ -182,6 +186,17 @@ export const DocumentCaptureModal: React.FC<DocumentCaptureModalProps> = ({
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter(d => d.kind === 'videoinput');
+        setCameras(videoDevices);
+        if (!selectedCamera) {
+          const backCam = videoDevices.find(d => d.label.toLowerCase().includes('back') || d.label.toLowerCase().includes('environment'));
+          if (backCam) {
+            setSelectedCamera(backCam.deviceId);
+          }
+        }
+      } catch (e) {}
     } catch (err: any) {
       console.error("Camera access error:", err);
       setCameraError("Unable to access camera. Please upload your document instead.");
@@ -237,6 +252,16 @@ export const DocumentCaptureModal: React.FC<DocumentCaptureModalProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
 
+    if (!file.type.startsWith('image/')) {
+      alert('Please select a valid image file (JPEG, PNG, WEBP).');
+      return;
+    }
+
+    if (file.size > maxSizeMB * 1024 * 1024) {
+      alert(`Selected file exceeds the maximum allowed size of ${maxSizeMB}MB.`);
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = () => {
       setImageSrc(reader.result as string);
@@ -244,6 +269,7 @@ export const DocumentCaptureModal: React.FC<DocumentCaptureModalProps> = ({
       setRotation(0);
     };
     reader.readAsDataURL(file);
+    e.target.value = '';
   };
 
   // Perform actual Crop Operation and output Cropped File
@@ -291,6 +317,10 @@ export const DocumentCaptureModal: React.FC<DocumentCaptureModalProps> = ({
     canvas.toBlob(
       (blob) => {
         if (blob) {
+          if (blob.size > maxSizeMB * 1024 * 1024) {
+            alert(`Cropped document image (${(blob.size / (1024 * 1024)).toFixed(1)}MB) exceeds ${maxSizeMB}MB limit.`);
+            return;
+          }
           const croppedFile = new File([blob], `cropped_${fieldLabel.toLowerCase().replace(/\s+/g, '_')}.jpg`, {
             type: 'image/jpeg',
             lastModified: Date.now(),

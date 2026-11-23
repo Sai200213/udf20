@@ -24,15 +24,27 @@ const AuthGuard: React.FC<AuthGuardProps> = ({ children, allowedUserTypes }) => 
         );
     }
 
-    if (!user) {
+    const isPublicOrGuest = !user || user.type === UserType.PUBLIC || (user as any).roleId === 'guest';
+
+    if (isPublicOrGuest) {
         const isPathAdmin = location.pathname.startsWith('/admin');
-        const redirectPath = isPathAdmin ? '/admin/login' : '/login';
-        console.warn(`AuthGuard: No user found for path ${location.pathname}. Redirecting to ${redirectPath}`);
+        const isPathEmployee = location.pathname.startsWith('/employee');
+        const redirectPath = isPathAdmin ? '/admin/login' : (isPathEmployee ? '/employee/login' : '/login');
+        console.warn(`AuthGuard: Guest or unauthenticated user on protected path ${location.pathname}. Redirecting to ${redirectPath}`);
         return <Navigate to={redirectPath} state={{ from: location }} replace />;
     }
 
     if (allowedUserTypes && !allowedUserTypes.includes(user.type as UserType)) {
-        const redirectPath = user.type === UserType.ADMIN ? '/admin/dashboard' : '/employee/dashboard';
+        const isPathAdmin = location.pathname.startsWith('/admin');
+        const isPathEmployee = location.pathname.startsWith('/employee');
+        let redirectPath = '/';
+        if (user.type === UserType.ADMIN) {
+            redirectPath = '/admin/dashboard';
+        } else if (user.type === UserType.EMPLOYEE) {
+            redirectPath = '/employee/dashboard';
+        } else {
+            redirectPath = isPathAdmin ? '/admin/login' : (isPathEmployee ? '/employee/login' : '/login');
+        }
         console.warn(`AuthGuard: User type ${user.type} not allowed for path ${location.pathname}. Redirecting to ${redirectPath}`);
         return <Navigate to={redirectPath} replace />;
     }
@@ -42,7 +54,3 @@ const AuthGuard: React.FC<AuthGuardProps> = ({ children, allowedUserTypes }) => 
 };
 
 export default AuthGuard;
-
-
-
-

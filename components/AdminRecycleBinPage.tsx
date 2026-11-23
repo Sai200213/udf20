@@ -14,6 +14,8 @@ import {
 } from 'lucide-react';
 import Button from './common/Button';
 import Modal from './common/Modal';
+import { useAuth } from '../src/context/AuthContext';
+import { Permission } from '../types';
 
 interface AdminRecycleBinPageProps {
   onNotify: (msg: string, type?: 'success' | 'error' | 'info' | 'warning') => void;
@@ -77,6 +79,13 @@ const AdminRecycleBinPage: React.FC<AdminRecycleBinPageProps> = ({
   isSuperAdmin,
   onRefreshData
 }) => {
+  const { user, hasPermission } = useAuth();
+  const allowedSiteIds: string[] = (user as any)?.sitesManaged || [];
+  const hasGlobalView = isSuperAdmin || 
+    hasPermission(Permission.MANAGE_SYSTEM) || 
+    hasPermission(Permission.EMPLOYEES_VIEW_SCOPE_ALL) || 
+    hasPermission(Permission.SITES_MANAGE);
+
   const [items, setItems] = useState<RecycleBinItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -116,6 +125,13 @@ const AdminRecycleBinPage: React.FC<AdminRecycleBinPageProps> = ({
       if (selectedType !== 'ALL' && item.itemType !== selectedType) {
         return false;
       }
+      // Site Scoping check for site-scoped supervisors (UDF-AUD-295)
+      if (!hasGlobalView && allowedSiteIds.length > 0) {
+        const itemSiteId = item.metadata?.siteId || item.data?.currentSiteId || item.data?.siteId || '';
+        if (itemSiteId && !allowedSiteIds.includes(itemSiteId)) {
+          return false;
+        }
+      }
       // Search Filter
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
@@ -129,7 +145,7 @@ const AdminRecycleBinPage: React.FC<AdminRecycleBinPageProps> = ({
       }
       return true;
     });
-  }, [items, selectedType, searchQuery]);
+  }, [items, selectedType, searchQuery, hasGlobalView, allowedSiteIds]);
 
   // Statistics
   const stats = useMemo(() => {
@@ -194,11 +210,13 @@ const AdminRecycleBinPage: React.FC<AdminRecycleBinPageProps> = ({
     }
   };
 
-  // Calculate days remaining before auto-purge
-  const getDaysRemaining = (expiresAtStr: string) => {
+  // Calculate days remaining before auto-purge (UDF-AUD-296)
+  const getDaysRemaining = (expiresAtStr?: string) => {
     try {
+      if (!expiresAtStr) return 30;
       const expires = new Date(expiresAtStr).getTime();
-      const now = new Date().getTime();
+      if (isNaN(expires)) return 30;
+      const now = Date.now();
       const diffDays = Math.ceil((expires - now) / (1000 * 60 * 60 * 24));
       return Math.max(0, diffDays);
     } catch {

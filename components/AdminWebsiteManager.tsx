@@ -4,7 +4,7 @@ import { getBlogPosts, createBlogPost, updateBlogPost, deleteBlogPost, BlogPost 
 import { uploadFile } from '../src/services/storageService';
 import { Edit, Trash, Plus, Globe, Settings, PlusCircle, Save, BookOpen, MapPin, Shield, CheckCircle, Info, ClipboardCheck, HelpCircle, Trophy, UserCheck, MessageSquare, Gift, ShoppingBag, Sparkles, Activity, Database, UploadCloud, Sliders, Lock, Unlock, RefreshCw } from 'lucide-react';
 import { db } from '../src/firebase/config';
-import { collection, getDocs, getDoc, doc, query, orderBy, where, updateDoc, setDoc, deleteDoc, addDoc, onSnapshot } from 'firebase/firestore';
+import { collection, getDocs, getDoc, doc, query, orderBy, where, updateDoc, setDoc, deleteDoc, addDoc, onSnapshot, limit } from 'firebase/firestore';
 import { sanitizeHtml } from '../src/utils/sanitizeHtml';
 
 const getFormattedImageUrl = (url?: string) => {
@@ -42,9 +42,9 @@ const AdminWebsiteManager: React.FC<{ isSuperAdmin: boolean; userRole?: any }> =
 
     const updatePortalConfigField = async (field: string, value: any) => {
         try {
-            await updateDoc(doc(db, 'settings', 'portal_config'), {
+            await setDoc(doc(db, 'settings', 'portal_config'), {
                 [field]: value
-            });
+            }, { merge: true });
             setMessage('Safeguard configuration updated.');
             setTimeout(() => setMessage(''), 3000);
         } catch (err: any) {
@@ -137,7 +137,7 @@ const AdminWebsiteManager: React.FC<{ isSuperAdmin: boolean; userRole?: any }> =
 
     const loadAttendanceRecords = async () => {
         try {
-            const snap = await getDocs(query(collection(db, 'attendance'), orderBy('date', 'desc')));
+            const snap = await getDocs(query(collection(db, 'attendance'), orderBy('date', 'desc'), limit(200)));
             const list = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
             setAttendanceRecords(list);
         } catch (err) {

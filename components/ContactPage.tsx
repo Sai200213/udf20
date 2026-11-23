@@ -17,6 +17,7 @@ const ContactPage: React.FC = () => {
     const [phone, setPhone] = useState('');
     const [subject, setSubject] = useState('General Inquiry');
     const [message, setMessage] = useState('');
+    const [honeypot, setHoneypot] = useState('');
     const [submitting, setSubmitting] = useState(false);
     const [submitted, setSubmitted] = useState(false);
     const [error, setError] = useState('');
@@ -46,15 +47,53 @@ const ContactPage: React.FC = () => {
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        setSubmitting(true);
         setError('');
+
+        // Anti-spam bot trap
+        if (honeypot.trim()) {
+            setSubmitted(true);
+            setName('');
+            setEmail('');
+            setPhone('');
+            setMessage('');
+            setHoneypot('');
+            return;
+        }
+
+        const trimmedName = name.trim();
+        const trimmedEmail = email.trim();
+        const trimmedPhone = phone.trim();
+        const trimmedMessage = message.trim();
+
+        if (trimmedName.length < 2 || trimmedName.length > 100) {
+            setError('Please enter a valid full name (2 to 100 characters).');
+            return;
+        }
+
+        if (trimmedEmail.length < 5 || trimmedEmail.length > 120 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+            setError('Please enter a valid email address (5 to 120 characters).');
+            return;
+        }
+
+        if (trimmedPhone.length < 10) {
+            setError('Please enter a valid 10-digit mobile number.');
+            return;
+        }
+
+        if (trimmedMessage.length < 5 || trimmedMessage.length > 3000) {
+            setError('Message details must be between 5 and 3000 characters.');
+            return;
+        }
+
+        setSubmitting(true);
         try {
             await addDoc(collection(db, 'contact_messages'), {
-                name,
-                email,
-                phone,
+                name: trimmedName,
+                email: trimmedEmail,
+                phone: trimmedPhone,
                 subject,
-                message,
+                message: trimmedMessage,
+                honeypot: '',
                 timestamp: serverTimestamp()
             });
             setSubmitted(true);
@@ -62,6 +101,7 @@ const ContactPage: React.FC = () => {
             setEmail('');
             setPhone('');
             setMessage('');
+            setHoneypot('');
         } catch (err) {
             console.error('Failed to submit contact message:', err);
             setError('Something went wrong. Please try calling our support hotline directly.');
@@ -251,6 +291,20 @@ const ContactPage: React.FC = () => {
                                         onChange={(e) => setMessage(e.target.value)}
                                         placeholder="Type details of your inquiry here..."
                                         className="w-full px-3 py-2 text-sm border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all bg-slate-50 focus:bg-white"
+                                    />
+                                </div>
+
+                                {/* Anti-spam bot trap (hidden from legitimate users) */}
+                                <div className="hidden" aria-hidden="true" style={{ display: 'none' }}>
+                                    <label htmlFor="website_hp">Leave this empty</label>
+                                    <input
+                                        id="website_hp"
+                                        type="text"
+                                        name="website_hp"
+                                        value={honeypot}
+                                        onChange={(e) => setHoneypot(e.target.value)}
+                                        tabIndex={-1}
+                                        autoComplete="off"
                                     />
                                 </div>
 

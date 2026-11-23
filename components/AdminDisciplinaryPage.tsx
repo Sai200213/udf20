@@ -39,11 +39,19 @@ const AdminDisciplinaryPage: React.FC<AdminDisciplinaryPageProps> = ({
   const [description, setDescription] = useState('');
   const [supportingDoc, setSupportingDoc] = useState<File | null>(null);
 
+  const hasPermission = (p: Permission) => {
+    if (isSuperAdmin) return true;
+    if (userRole?.isDisabled === true) return false;
+    const overrides = (authUser as any)?.permissionOverrides;
+    if (overrides && overrides[p] !== undefined) {
+      return Boolean(overrides[p]);
+    }
+    return Boolean(userRole?.permissions?.includes(p));
+  };
+
   const hasManagePerm = isSuperAdmin || 
-    Boolean(userRole?.permissions?.includes(Permission.DISCIPLINE_MANAGE)) || 
-    Boolean(userRole?.permissions?.includes(Permission.MANAGE_DISCIPLINE)) ||
-    Boolean((authUser as any)?.permissionOverrides?.[Permission.DISCIPLINE_MANAGE]) ||
-    Boolean((authUser as any)?.permissionOverrides?.[Permission.MANAGE_DISCIPLINE]);
+    hasPermission(Permission.DISCIPLINE_MANAGE) || 
+    hasPermission(Permission.MANAGE_DISCIPLINE);
 
   // Load employee lookup for site filtering and dropdown
   React.useEffect(() => {
@@ -77,7 +85,7 @@ const AdminDisciplinaryPage: React.FC<AdminDisciplinaryPageProps> = ({
 
     const empInfo = employeeLookup[selectedEmployeeId];
     const employeeName = empInfo ? empInfo.name : 'Unknown';
-    const siteId = (empInfo as any)?.siteId || undefined;
+    const siteId = (empInfo as any)?.siteId || '';
 
     onAddDiscipline({
       employeeId: selectedEmployeeId,
@@ -86,7 +94,7 @@ const AdminDisciplinaryPage: React.FC<AdminDisciplinaryPageProps> = ({
       date: incidentDate,
       description,
       siteId,
-      document: supportingDoc || undefined
+      document: supportingDoc || null as any
     });
 
     setIsModalOpen(false);
@@ -108,11 +116,12 @@ const AdminDisciplinaryPage: React.FC<AdminDisciplinaryPageProps> = ({
     }
   };
 
-  const hasDisciplineScopeAll = isSuperAdmin || userRole?.permissions.includes(Permission.DISCIPLINE_VIEW_SCOPE_ALL);
+  const hasDisciplineScopeAll = isSuperAdmin || hasPermission(Permission.DISCIPLINE_VIEW_SCOPE_ALL);
+  const canDeleteDiscipline = isSuperAdmin || hasPermission(Permission.DISCIPLINE_DELETE);
 
   const filteredActions = disciplinaryActions.filter(action => {
     if (!hasDisciplineScopeAll && allowedSiteIds && allowedSiteIds.length > 0) {
-      if (action.siteId && !allowedSiteIds.includes(action.siteId)) return false;
+      if (!action.siteId || !allowedSiteIds.includes(action.siteId)) return false;
     }
     const matchesSearch = action.employeeName.toLowerCase().includes(searchTerm.toLowerCase()) ||
       action.employeeId.toLowerCase().includes(searchTerm.toLowerCase());
@@ -169,12 +178,12 @@ const AdminDisciplinaryPage: React.FC<AdminDisciplinaryPageProps> = ({
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Description</th>
               <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Filed By</th>
-              {isSuperAdmin && <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actions</th>}
+              {canDeleteDiscipline && <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actions</th>}
             </tr>
           </thead>
           <tbody className="bg-white divide-y divide-gray-200">
             {filteredActions.length === 0 ? (
-              <tr><td colSpan={5} className="px-6 py-10 text-center text-gray-400 italic">No disciplinary records found.</td></tr>
+              <tr><td colSpan={canDeleteDiscipline ? 6 : 5} className="px-6 py-10 text-center text-gray-400 italic">No disciplinary records found.</td></tr>
             ) : filteredActions.map(action => (
               <tr key={action.id} className="hover:bg-gray-50">
                 <td className="px-6 py-4 whitespace-nowrap">
@@ -203,10 +212,14 @@ const AdminDisciplinaryPage: React.FC<AdminDisciplinaryPageProps> = ({
                 <td className="px-6 py-4 whitespace-nowrap text-right text-sm text-gray-500">
                   {action.filedBy}
                 </td>
-                {isSuperAdmin && (
+                {canDeleteDiscipline && (
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm">
                     <button
-                      onClick={() => onDeleteDiscipline?.(action.id)}
+                      onClick={() => {
+                        if (!canDeleteDiscipline) return;
+                        if (!window.confirm(`Are you sure you want to delete the disciplinary record for "${action.employeeName}"?`)) return;
+                        onDeleteDiscipline?.(action.id);
+                      }}
                       className="text-red-400 hover:text-red-700 transition-colors"
                       title="Delete Record"
                     >

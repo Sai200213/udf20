@@ -4,7 +4,7 @@ import Button from './common/Button';
 import Modal from './common/Modal';
 import { Upload, Download, AlertTriangle, CheckCircle, X, FileText, Loader2, XCircle, Settings, ChevronDown, ChevronRight } from 'lucide-react';
 import { parseCSV, validateBulkImportData, bulkImportEmployees, getBulkImportTemplate, getBulkImportExcelTemplateBlob, checkForDatabaseDuplicates, BulkImportRow, BulkImportResult, DuplicateConflict, ValidationSettings, ValidationSeverity } from '../src/utils/bulkImportUtils';
-import * as XLSX from 'xlsx';
+// Dynamic import of xlsx in handleFileUpload (UDF-AUD-388)
 
 interface BulkImportModalProps {
     isOpen: boolean;
@@ -52,14 +52,19 @@ const BulkImportModal: React.FC<BulkImportModalProps> = ({
 
         if (isExcel) {
             const reader = new FileReader();
-            reader.onload = (event) => {
+            reader.onload = async (event) => {
                 try {
+                    const XLSX = await import('xlsx');
                     const data = new Uint8Array(event.target?.result as ArrayBuffer);
                     const workbook = XLSX.read(data, { type: 'array', raw: false });
                     const firstSheetName = workbook.SheetNames[0];
                     const worksheet = workbook.Sheets[firstSheetName];
                     const csvContent = XLSX.utils.sheet_to_csv(worksheet);
                     const rows = parseCSV(csvContent);
+                    if (rows.length > 500) {
+                        alert("Maximum 500 rows allowed per import. Please reduce rows and try again.");
+                        return;
+                    }
                     setParsedData(rows);
                     runValidation(rows, validationSettings);
                     if (rows.length > 0) {
@@ -74,19 +79,26 @@ const BulkImportModal: React.FC<BulkImportModalProps> = ({
         } else {
             const reader = new FileReader();
             reader.onload = (event) => {
-                const content = event.target?.result as string;
-                const rows = parseCSV(content);
-                setParsedData(rows);
-
-                // Validate
-                runValidation(rows, validationSettings);
-
-                if (rows.length > 0) {
-                    setStep('preview');
+                try {
+                    const content = event.target?.result as string;
+                    const rows = parseCSV(content);
+                    if (rows.length > 500) {
+                        alert("Maximum 500 rows allowed per import. Please reduce rows and try again.");
+                        return;
+                    }
+                    setParsedData(rows);
+                    runValidation(rows, validationSettings);
+                    if (rows.length > 0) {
+                        setStep('preview');
+                    }
+                } catch (err) {
+                    console.error("CSV parse error:", err);
+                    alert("Failed to parse CSV file. Please ensure it is properly formatted.");
                 }
             };
             reader.readAsText(file);
         }
+        e.target.value = '';
     }, [runValidation, validationSettings]);
 
     const handleDownloadTemplate = () => {
@@ -120,9 +132,9 @@ const BulkImportModal: React.FC<BulkImportModalProps> = ({
             } else {
                 handleStartImport();
             }
-        } catch (err) {
+        } catch (err: any) {
             console.error("Duplicate check failed:", err);
-            handleStartImport(); // Fallback to normal import if check fails
+            alert("Duplicate verification failed: " + (err?.message || "Please check your network and try again."));
         } finally {
             setIsCheckingDuplicates(false);
         }
@@ -577,7 +589,7 @@ const BulkImportModal: React.FC<BulkImportModalProps> = ({
                             {formSections.map((section, idx) => (
                                 <div key={idx} className="space-y-3">
                                     <h4 className="font-bold text-gray-700 text-sm uppercase tracking-wider border-b pb-1">
-                                        {section.title}
+                                        {section.name || section.title}
                                     </h4>
                                     <div className="grid grid-cols-1 gap-2">
                                         {(section.fields || []).filter(f => ![FieldType.HEADER, FieldType.INFO_TEXT].includes(f.type)).map((field) => {

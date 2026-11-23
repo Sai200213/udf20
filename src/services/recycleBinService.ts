@@ -1,6 +1,6 @@
 import { 
   collection, doc, getDoc, getDocs, setDoc, deleteDoc, 
-  updateDoc, query, orderBy, onSnapshot, serverTimestamp 
+  updateDoc, query, orderBy, onSnapshot, serverTimestamp, where, limit 
 } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { db, auth, functions } from '../firebase/config';
@@ -42,8 +42,7 @@ export async function moveToRecycleBin(params: {
 }): Promise<string> {
   const docRef = doc(collection(db, RECYCLE_BIN_COLLECTION));
   const now = new Date();
-  const expires = new Date();
-  expires.setDate(now.getDate() + RETENTION_DAYS);
+  const expires = new Date(now.getTime() + RETENTION_DAYS * 24 * 60 * 60 * 1000);
 
   const binItem: Omit<RecycleBinItem, 'id'> = {
     itemType: params.itemType,
@@ -136,217 +135,11 @@ export async function restoreFromRecycleBin(
     if (res.data && res.data.success) {
       return res.data;
     }
+    throw new Error(res.data?.message || 'Restore failed on server.');
   } catch (serverErr: any) {
-    console.warn('[RECYCLE_BIN] Server restore failed, falling back to local restore:', serverErr);
-  }
-
-  const binDocRef = doc(db, RECYCLE_BIN_COLLECTION, recycleBinItemId);
-  const binSnap = await getDoc(binDocRef);
-
-  if (!binSnap.exists()) {
-    throw new Error('Record not found in Recycle Bin or already restored.');
-  }
-
-  const binItem = binSnap.data() as RecycleBinItem;
-  const { itemType, originalId, data } = binItem;
-
-  try {
-    switch (itemType) {
-      case 'SITE': {
-        // Restore site back to settings/sites and sites collection
-        const sitesDocRef = doc(db, SETTINGS_COLLECTION, 'sites');
-        const sitesSnap = await getDoc(sitesDocRef);
-        let existingSites: Site[] = [];
-        if (sitesSnap.exists()) {
-          existingSites = sitesSnap.data().sites || [];
-        }
-
-        // Avoid duplicate ID if a new site was created with same ID
-        const filtered = existingSites.filter(s => s.id !== originalId);
-        const restoredSite: Site = {
-          ...data,
-          id: originalId,
-          isActive: true
-        };
-        const updatedSites = [...filtered, restoredSite];
-
-        await updateDoc(sitesDocRef, { sites: updatedSites });
-
-        // Restore any linked vacancies that were archived with this site
-        if (binItem.metadata?.linkedVacancies && Array.isArray(binItem.metadata.linkedVacancies)) {
-          for (const vac of binItem.metadata.linkedVacancies) {
-            try {
-              if (vac.id) {
-                await setDoc(doc(db, 'vacancies', vac.id), {
-                  ...vac,
-                  status: 'Open',
-                  isDeleted: false,
-                  restoredAt: new Date().toISOString()
-                }, { merge: true });
-              }
-            } catch (vErr) {
-              console.warn('Failed to restore linked vacancy during site restore:', vErr);
-            }
-          }
-        }
-        break;
-      }
-
-      case 'STAFF': {
-        // SEC-07: Verify restorer permissions and sanitize restored data to prevent SuperAdmin privilege escalation
-        const tokenResult = await auth.currentUser?.getIdTokenResult();
-        const claims = tokenResult?.claims || {};
-        const isSuperAdminRestorer = claims.isSuperAdmin === true || claims.roleId === 'role-super-admin';
-
-        const restoredData = { ...data };
-        if (!isSuperAdminRestorer && (restoredData.roleId === 'role-super-admin' || restoredData.type === 'Admin')) {
-          throw new Error('Unauthorized: Only SuperAdmin can restore accounts with SuperAdmin privileges.');
-        }
-
-        const savedSiteIds = Array.from(new Set([
-          ...(Array.isArray(binItem.metadata?.linkedSites) ? binItem.metadata.linkedSites : []),
-          ...(Array.isArray(restoredData.sitesManaged) ? restoredData.sitesManaged : [])
-        ])).filter(Boolean);
-        const finalSiteIds = await syncRestoredStaffSitesLocal(originalId, savedSiteIds, restoreSiteLinks);
-
-        // Restore staff account to staff_accounts collection with synchronized sitesManaged
-        const staffRef = doc(db, 'staff_accounts', originalId);
-        await setDoc(staffRef, {
-          ...restoredData,
-          sitesManaged: finalSiteIds,
-          isDisabled: false,
-          isDeleted: false,
-          deletedAt: null,
-          restoredAt: new Date().toISOString()
-        }, { merge: true });
-
-        // Re-enable Firebase Auth user account
-        try {
-          const { setStaffUserStatus } = await import('./staffService');
-          await setStaffUserStatus(originalId, false);
-        } catch (authErr) {
-          console.warn('Could not re-enable Firebase Auth for restored staff:', authErr);
-        }
-        break;
-      }
-
-      case 'EMPLOYEE': {
-        // Restore employee record with active status and clear deletedAt
-        const resolved = await resolveEmployeeDoc(originalId);
-        const empRef = resolved?.ref || doc(db, 'employees', originalId);
-        await updateDoc(empRef, {
-          isActive: true,
-          isDeleted: false,
-          deletedAt: null,
-          status: 'Active',
-          restoredAt: new Date().toISOString()
-        });
-        break;
-      }
-
-      case 'SUBMISSION': {
-        // Restore onboarding submission and clear deletedAt so 30-day auto purge does not re-purge
-        const subRef = doc(db, 'onboarding_submissions', originalId);
-        await setDoc(subRef, {
-          ...data,
-          isActive: true,
-          isDeleted: false,
-          deletedAt: null,
-          status: data.status === 'Deleted' ? 'Pending' : (data.status || 'Pending'),
-          restoredAt: new Date().toISOString()
-        }, { merge: true });
-        break;
-      }
-
-      case 'INVITE': {
-        // Restore referral invite
-        const inviteRef = doc(db, 'referral_invites', originalId);
-        await setDoc(inviteRef, {
-          ...data,
-          status: 'Active',
-          isDeleted: false,
-          restoredAt: new Date().toISOString()
-        }, { merge: true });
-        break;
-      }
-
-      case 'VACANCY': {
-        // Restore vacancy
-        const vacRef = doc(db, 'vacancies', originalId);
-        await setDoc(vacRef, {
-          ...data,
-          status: 'Open',
-          isDeleted: false,
-          restoredAt: new Date().toISOString()
-        }, { merge: true });
-        break;
-      }
-
-      case 'DESIGNATION': {
-        // Restore designation back to portal_config/global.designations
-        const desigName = binItem.name || binItem.originalId;
-        const globalDocRef = doc(db, SETTINGS_COLLECTION, 'portal_config');
-        const globalSnap = await getDoc(globalDocRef);
-        let currentDesignations: string[] = [];
-        if (globalSnap.exists()) {
-          currentDesignations = globalSnap.data().designations || [];
-        }
-        if (!currentDesignations.includes(desigName)) {
-          const updatedDesignations = [...currentDesignations, desigName];
-          await setDoc(globalDocRef, { designations: updatedDesignations }, { merge: true });
-        }
-
-        // Restore allowedDesignations to sites that previously authorized it
-        const targetSites: string[] = binItem.metadata?.allowedSiteIds || binItem.data?.allowedSiteIds || [];
-        if (targetSites.length > 0) {
-          const sitesDocRef = doc(db, SETTINGS_COLLECTION, 'sites');
-          const sitesSnap = await getDoc(sitesDocRef);
-          if (sitesSnap.exists()) {
-            const existingSites: Site[] = sitesSnap.data().sites || [];
-            let modified = false;
-            const updatedSites = existingSites.map(s => {
-              if (targetSites.includes(s.id)) {
-                const allowed = s.allowedDesignations || [];
-                if (!allowed.includes(desigName)) {
-                  modified = true;
-                  return { ...s, allowedDesignations: [...allowed, desigName] };
-                }
-              }
-              return s;
-            });
-            if (modified) {
-              await updateDoc(sitesDocRef, { sites: updatedSites });
-            }
-          }
-        }
-        break;
-      }
-
-      default: {
-        // Generic restore to originalCollection
-        if (binItem.originalCollection && originalId) {
-          const targetRef = doc(db, binItem.originalCollection, originalId);
-          await setDoc(targetRef, {
-            ...data,
-            isDeleted: false,
-            restoredAt: new Date().toISOString()
-          }, { merge: true });
-        } else {
-          throw new Error(`Unsupported item type: ${itemType}`);
-        }
-      }
-    }
-
-    // Delete item from recycle bin once successfully restored
-    await deleteDoc(binDocRef);
-
-    return {
-      success: true,
-      message: `Successfully restored "${binItem.name}" to its original state!`
-    };
-  } catch (err: any) {
-    console.error('Failed to restore item from recycle bin:', err);
-    throw new Error(err.message || 'Failed to restore record');
+    if (serverErr?.code === 'functions/permission-denied') throw serverErr;
+    console.error('[RECYCLE_BIN] Server restore failed:', serverErr);
+    throw new Error(serverErr.message || 'Failed to restore record via server.');
   }
 }
 
@@ -370,9 +163,33 @@ export async function permanentDeleteFromRecycleBin(recycleBinItemId: string): P
         } else if (binData.itemType === 'SUBMISSION') {
           const { deleteSubmission } = await import('./employeeService');
           await deleteSubmission(originalId);
+        } else if (binData.itemType === 'SITE') {
+          // Clean up soft-deleted vacancies linked to this site (UDF-AUD-95)
+          try {
+            const vacSnap = await getDocs(query(collection(db, 'vacancies'), where('siteId', '==', originalId)));
+            const vacDeletes = vacSnap.docs.filter(d => (d.data() as any).isDeleted === true).map(d => deleteDoc(d.ref));
+            await Promise.all(vacDeletes);
+          } catch (e) {
+            console.warn(`Could not purge vacancies for site ${originalId}:`, e);
+          }
+        } else if (binData.itemType === 'VACANCY') {
+          try {
+            await deleteDoc(doc(db, 'vacancies', originalId));
+          } catch (e) {
+            console.error(`Could not purge vacancy ${originalId}:`, e);
+            throw e;
+          }
+        } else if (binData.itemType === 'INVITE') {
+          try {
+            await deleteDoc(doc(db, 'referral_invites', originalId));
+          } catch (e) {
+            console.error(`Could not purge referral_invite ${originalId}:`, e);
+            throw e;
+          }
         }
       } catch (purgeErr) {
-        console.warn(`Could not purge underlying ${binData.itemType} (${originalId}):`, purgeErr);
+        console.error(`Could not purge underlying ${binData.itemType} (${originalId}):`, purgeErr);
+        throw new Error(`Underlying ${binData.itemType} purge failed; keeping Recycle Bin entry for safety.`);
       }
     }
   }
@@ -385,18 +202,19 @@ export async function permanentDeleteFromRecycleBin(recycleBinItemId: string): P
 export async function emptyRecycleBin(): Promise<number> {
   const snap = await getDocs(collection(db, RECYCLE_BIN_COLLECTION));
   let count = 0;
-  for (const d of snap.docs) {
-    await permanentDeleteFromRecycleBin(d.id);
-    count++;
+  for (let i = 0; i < snap.docs.length; i += 10) {
+    const chunk = snap.docs.slice(i, i + 10);
+    await Promise.all(chunk.map(d => permanentDeleteFromRecycleBin(d.id)));
+    count += chunk.length;
   }
   return count;
 }
 
 /**
- * Subscribe to the Recycle Bin in real time.
+ * Subscribe to the Recycle Bin in real time (capped at maxLimit to prevent unbounded memory growth - UDF-AUD-295).
  */
-export function subscribeToRecycleBin(callback: (items: RecycleBinItem[]) => void): () => void {
-  const q = query(collection(db, RECYCLE_BIN_COLLECTION), orderBy('deletedAt', 'desc'));
+export function subscribeToRecycleBin(callback: (items: RecycleBinItem[]) => void, maxLimit = 100): () => void {
+  const q = query(collection(db, RECYCLE_BIN_COLLECTION), orderBy('deletedAt', 'desc'), limit(maxLimit));
   return onSnapshot(q, (snapshot) => {
     const items: RecycleBinItem[] = snapshot.docs.map(d => ({
       id: d.id,

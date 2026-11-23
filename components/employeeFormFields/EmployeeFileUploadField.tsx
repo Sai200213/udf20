@@ -7,7 +7,7 @@ import { ref, getBlob } from 'firebase/storage';
 import { storage, ensureAuthenticated } from '../../src/firebase/config';
 import { uploadSubmissionDocument, autoCompressFile, getSecureURL } from '../../src/services/storageService';
 
-const EmployeeFileUploadField: React.FC<EmployeeFieldProps> = ({ field, value, onChange, error, disabled }) => {
+const EmployeeFileUploadField: React.FC<EmployeeFieldProps> = ({ field, value, onChange, error, disabled, draftId }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<'select' | 'camera' | 'crop'>('select');
   const [modalImageSrc, setModalImageSrc] = useState<string | null>(null);
@@ -101,18 +101,18 @@ const EmployeeFileUploadField: React.FC<EmployeeFieldProps> = ({ field, value, o
         setIsResolving(true);
         const getUrl = async () => {
           try {
-            const isImg = /\.(jpg|jpeg|png|webp)$/i.test(valPath);
-            if (isImg) {
-              const secureUrl = await getSecureURL(valPath);
-              if (active && secureUrl) {
-                setResolvedUrl(secureUrl);
+            const isImg = /\.(jpg|jpeg|png|webp)$/i.test(valPath) || valPath.includes('GoogleProfile') || valPath.includes('photo');
+            const secureUrl = await getSecureURL(valPath);
+            if (active && secureUrl) {
+              setResolvedUrl(secureUrl);
+              if (isImg) {
                 setLocalThumbnail(secureUrl);
-              }
-            } else {
-              if (active) {
-                setResolvedUrl(null);
+              } else {
                 setLocalThumbnail(null);
               }
+            } else if (active) {
+              setResolvedUrl(null);
+              setLocalThumbnail(null);
             }
           } catch (err) {
             console.error("Failed to resolve storage URL:", err);
@@ -133,6 +133,25 @@ const EmployeeFileUploadField: React.FC<EmployeeFieldProps> = ({ field, value, o
 
   // Background upload logic
   const startBackgroundUpload = async (file: File) => {
+    // 0. Validate against field.allowedFileTypes if configured in Form Builder (UDF-AUD-265)
+    if (field.allowedFileTypes && field.allowedFileTypes.trim()) {
+      const allowed = field.allowedFileTypes.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
+      const mime = (file.type || '').toLowerCase();
+      const matches = allowed.some(rule => {
+        if (rule.startsWith('.')) return ext === rule;
+        if (rule.endsWith('/*')) {
+          const base = rule.slice(0, -2);
+          return mime.startsWith(base);
+        }
+        return mime === rule || ext === '.' + rule;
+      });
+      if (!matches) {
+        alert(`Invalid file format. Allowed types: ${field.allowedFileTypes}`);
+        return;
+      }
+    }
+
     // 1. Validate file extension and MIME type
     const isImage = file.type.startsWith('image/') || /\.(jpg|jpeg|png|webp)$/i.test(file.name);
     const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
@@ -141,31 +160,32 @@ const EmployeeFileUploadField: React.FC<EmployeeFieldProps> = ({ field, value, o
       return;
     }
 
-    // 2. Validate max size before / after compression
-    const maxMB = field.maxFileSizeMB || 5;
-    if (file.size > maxMB * 1024 * 1024 && !isImage) {
-      alert(`File size must be less than ${maxMB}MB.`);
+    // 2. Validate absolute maximum uncompressed ceiling (15MB)
+    const MAX_UNCOMPRESSED_CEILING = 15 * 1024 * 1024;
+    if (file.size > MAX_UNCOMPRESSED_CEILING) {
+      alert("File size exceeds 15MB limit. Please choose a smaller file.");
       return;
     }
+
+    const maxMB = field.maxFileSizeMB || 5;
 
     setIsUploading(true);
     setUploadProgress(0);
     try {
-      // 3. Auto-compress image files client-side before upload
-      let fileToUpload = file;
-      if (isImage) {
-        fileToUpload = await autoCompressFile(file);
-      }
+      // 3. Auto-compress files (images and PDFs) client-side before checking limit and uploading
+      const fileToUpload = await autoCompressFile(file);
 
       if (fileToUpload.size > maxMB * 1024 * 1024) {
-        alert(`Compressed file size (${(fileToUpload.size / (1024 * 1024)).toFixed(2)}MB) exceeds limit of ${maxMB}MB.`);
+        alert(`File size (${(fileToUpload.size / (1024 * 1024)).toFixed(2)}MB) exceeds limit of ${maxMB}MB even after compression.`);
         return;
       }
 
       const path = await uploadSubmissionDocument(
         field.id,
         fileToUpload,
-        (percent) => setUploadProgress(percent)
+        (percent) => setUploadProgress(percent),
+        draftId || undefined,
+        { skipCompression: true }
       );
       onChange(field.id, path);
     } catch (err: any) {
@@ -236,10 +256,11 @@ const EmployeeFileUploadField: React.FC<EmployeeFieldProps> = ({ field, value, o
     startBackgroundUpload(croppedFile);
   };
 
-  // Open cropper for existing local image
+  // Open cropper for existing local or resolved image
   const handleOpenExistingCropper = () => {
-    if (localThumbnail && !(typeof value === 'string')) {
-      setModalImageSrc(localThumbnail);
+    const srcToUse = localThumbnail || resolvedUrl;
+    if (srcToUse) {
+      setModalImageSrc(srcToUse);
       setModalMode('crop');
       setIsModalOpen(true);
     } else if (value instanceof File) {
@@ -442,7 +463,7 @@ const EmployeeFileUploadField: React.FC<EmployeeFieldProps> = ({ field, value, o
               </Button>
             )}
 
-            {isImage && !isStringVal && (
+            {isImage && (Boolean(localThumbnail) || Boolean(resolvedUrl) || value instanceof File) && (
               <Button
                 type="button"
                 onClick={handleOpenExistingCropper}
@@ -471,8 +492,16 @@ const EmployeeFileUploadField: React.FC<EmployeeFieldProps> = ({ field, value, o
 
             <Button
               type="button"
-              onClick={() => {
+              onClick={async () => {
                 if (fileInputRef.current) fileInputRef.current.value = '';
+                if (valPath && typeof valPath === 'string' && valPath.startsWith('submissions/')) {
+                  try {
+                    const { deleteStorageFile } = await import('../../src/services/storageService');
+                    await deleteStorageFile(valPath);
+                  } catch (e) {
+                    console.warn("Could not delete removed file from storage:", e);
+                  }
+                }
                 onChange(field.id, null);
                 setLocalThumbnail(null);
                 setResolvedUrl(null);

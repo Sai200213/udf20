@@ -51,14 +51,40 @@ const secureOnCall = (optsOrHandler, maybeHandler) => {
     }, handler);
 };
 
+// Shared IP/UID rate limiting for sensitive lookup endpoints (max 10 requests per minute)
+const lookupRateLimits = new Map();
+
+function checkLookupRateLimit(identifier) {
+    const now = Date.now();
+    const windowMs = 60 * 1000; // 1 minute
+    const maxAttempts = 10;
+
+    let record = lookupRateLimits.get(identifier);
+    if (!record || now - record.startTime > windowMs) {
+        record = { count: 1, startTime: now };
+        lookupRateLimits.set(identifier, record);
+        return true;
+    }
+
+    if (record.count >= maxAttempts) {
+        return false;
+    }
+
+    record.count++;
+    return true;
+}
+
 // Secure server-side password hashing using bcrypt (cost 12)
 exports.hashCandidatePasswordServer = secureOnCall(async (request) => {
-    if (!request.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    if (!request.auth || (request.auth.token && request.auth.token.provider_id === 'anonymous')) {
+        throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated with a verified non-anonymous account');
     }
     const { password } = request.data || {};
-    if (!password || typeof password !== 'string' || password.length < 6) {
-        throw new functions.https.HttpsError('invalid-argument', 'Password must be at least 6 characters');
+    if (!password || typeof password !== 'string' || password.length < 6 || password.length > 72) {
+        throw new functions.https.HttpsError('invalid-argument', 'Password must be between 6 and 72 characters');
+    }
+    if (!checkLookupRateLimit(request.auth.uid)) {
+        throw new functions.https.HttpsError('resource-exhausted', 'Too many requests. Please slow down.');
     }
     const hashed = await hashPassword(password);
     return { passwordHash: hashed };
@@ -71,8 +97,11 @@ exports.hashCandidatePasswordServer = secureOnCall(async (request) => {
 // Check global uniqueness across all identity collections
 exports.checkGlobalUniqueness = secureOnCall(async (request) => {
     // Only authenticated users can check uniqueness (prevents public scraping)
-    if (!request.auth) {
-        throw new functions.https.HttpsError('unauthenticated', 'Verification rejected.');
+    if (!request.auth || (request.auth.token && request.auth.token.provider_id === 'anonymous')) {
+        throw new functions.https.HttpsError('unauthenticated', 'Verification rejected: Non-anonymous authentication required.');
+    }
+    if (!checkLookupRateLimit(request.auth.uid)) {
+        throw new functions.https.HttpsError('resource-exhausted', 'Too many uniqueness check requests.');
     }
 
     const { email, uid, options = {} } = request.data;
@@ -93,6 +122,7 @@ exports.checkGlobalUniqueness = secureOnCall(async (request) => {
                 { type: 'staff', query: db.collection('staff').where('email', '==', normalizedEmail).get() },
                 { type: 'staff_accounts', query: db.collection('staff_accounts').where('email', '==', normalizedEmail).get() },
                 { type: 'employees', query: db.collection('employees').where('profileData.personalDetails.email', '==', normalizedEmail).get() },
+                { type: 'employees', query: db.collection('employees').where('email', '==', normalizedEmail).get() },
                 { type: 'employees', query: db.collection('employees').where('linkedGoogleEmail', '==', normalizedEmail).get() },
                 { type: 'onboarding_submissions', query: db.collection('onboarding_submissions').where('email', '==', normalizedEmail).get() },
                 { type: 'onboarding_submissions', query: db.collection('onboarding_submissions').where('linkedGoogleEmail', '==', normalizedEmail).get() }
@@ -181,6 +211,9 @@ async function resolveExistingAuthEmailConflict(db, normalizedEmail) {
         legacyStaffDoc,
         empDoc,
         empUidSnap,
+        empLinkedSnap,
+        empGoogleEmailSnap,
+        empEmailSnap,
         subDoc,
         subUidSnap,
         subEmailSnap,
@@ -191,6 +224,9 @@ async function resolveExistingAuthEmailConflict(db, normalizedEmail) {
         db.collection('staff').doc(uid).get(),
         db.collection('employees').doc(uid).get(),
         db.collection('employees').where('uid', '==', uid).limit(1).get(),
+        db.collection('employees').where('linkedUid', '==', uid).limit(1).get(),
+        db.collection('employees').where('linkedGoogleEmail', '==', normalizedEmail).limit(1).get(),
+        db.collection('employees').where('email', '==', normalizedEmail).limit(1).get(),
         db.collection('onboarding_submissions').doc(uid).get(),
         db.collection('onboarding_submissions').where('linkedUid', '==', uid).limit(1).get(),
         db.collection('onboarding_submissions').where('email', '==', normalizedEmail).limit(1).get(),
@@ -209,6 +245,9 @@ async function resolveExistingAuthEmailConflict(db, normalizedEmail) {
         legacyStaffDoc.exists ||
         empDoc.exists ||
         !empUidSnap.empty ||
+        !empLinkedSnap.empty ||
+        !empGoogleEmailSnap.empty ||
+        !empEmailSnap.empty ||
         subDoc.exists ||
         !subUidSnap.empty ||
         !subEmailSnap.empty;
@@ -381,12 +420,22 @@ exports.setStaffUserStatus = secureOnCall(async (request) => {
         
         // 1. Update Firebase Auth status
         await admin.auth().updateUser(uid, { disabled: isDisabled });
+        if (isDisabled) {
+            // Revoke active refresh tokens immediately (UDF-AUD-179)
+            await admin.auth().revokeRefreshTokens(uid).catch(() => {});
+        }
 
         // 2. Update Firestore record in staff_accounts and users if exists
-        await db.collection('staff_accounts').doc(uid).set({ isDisabled }, { merge: true });
+        await db.collection('staff_accounts').doc(uid).set({
+            isDisabled,
+            claimsUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
         const legacyDoc = await db.collection('users').doc(uid).get();
         if (legacyDoc.exists) {
-            await db.collection('users').doc(uid).update({ isDisabled });
+            await db.collection('users').doc(uid).update({
+                isDisabled,
+                claimsUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
         }
 
         return { success: true, message: `User status set to ${isDisabled ? 'Disabled' : 'Enabled'} successfully` };
@@ -617,12 +666,21 @@ exports.employeeGoogleLogin = secureOnCall(async (request) => {
         const empData = employeeDoc ? employeeDoc.data() : null;
         const subData = submissionDoc ? submissionDoc.data() : null;
 
-        const isInactive = (empData && (empData.isActive === false || empData.isRelieved === true || empData.isBlocked === true || !!empData.deletedAt)) ||
-                           (subData && (subData.isActive === false || subData.isRelieved === true || subData.isBlocked === true || !!subData.deletedAt));
+        const isRecordBlocked = (d) => !!d && (
+            d.isActive === false ||
+            d.isDisabled === true ||
+            d.isRelieved === true ||
+            d.isBlocked === true ||
+            d.status === 'relieved' ||
+            d.status === 'terminated' ||
+            d.status === 'rejected' ||
+            !!d.deletedAt
+        );
+        const isInactive = isRecordBlocked(empData) || isRecordBlocked(subData);
 
         if (isInactive) {
             console.warn(`[GOOGLE LOGIN] Blocked login for inactive/relieved employee (UID: ${googleUid}, Email: ${email})`);
-            throw new functions.https.HttpsError('permission-denied', 'This account is inactive. Relieved employees cannot log in.');
+            throw new functions.https.HttpsError('permission-denied', 'This account is disabled or inactive. Relieved employees cannot log in.');
         }
 
         const portalId = (submissionDoc ? submissionDoc.id : null) || (employeeDoc ? (employeeDoc.data().portalId || employeeDoc.id) : null);
@@ -660,8 +718,15 @@ exports.employeeGoogleLogin = secureOnCall(async (request) => {
             }
         }
 
-        // Generate Custom Token using the *exact* Portal ID (global ID)
-        const customToken = await admin.auth().createCustomToken(portalId, { portal: 'employee', portalType: 'employee', authProvider: 'google' });
+        // Generate Custom Token using the *exact* Portal ID (global ID) with full employee claims
+        const customEmpId = (employeeDoc && employeeDoc.data().employeeId) || (submissionDoc && submissionDoc.data().employeeId) || portalId;
+        const customToken = await admin.auth().createCustomToken(portalId, {
+            portal: 'employee',
+            portalType: 'employee',
+            employeeId: customEmpId,
+            role: 'employee',
+            authProvider: 'google'
+        });
         
         // Clear fails
         await clearFailedAttempts(db, `login_${portalId}`);
@@ -808,8 +873,12 @@ exports.employeeLogin = secureOnCall(async (request) => {
             role: 'employee'
         });
 
-        // Link the stable UID to the employee record
-        await matchedDoc.ref.update({ uid: customTokenUid });
+        // Link the stable UID to the employee record, preserving linked Google account if present
+        const uidUpdate = { uid: customTokenUid };
+        if (matchedData.uid && matchedData.uid !== customTokenUid && !matchedData.linkedUid) {
+            uidUpdate.linkedUid = matchedData.uid;
+        }
+        await matchedDoc.ref.update(uidUpdate);
 
         // Upgrade legacy password to bcrypt if needed
         const isSha256 = matchedData.passwordHash && matchedData.passwordHash.length === 64 && !matchedData.passwordHash.startsWith('$2');
@@ -900,8 +969,14 @@ exports.verifyAndResetEmployeePassword = secureOnCall(async (request) => {
 
         const empRef = empDoc.ref;
         const empData = empDoc.data();
-        const profileData = empData.profileData || {};
-        const storedData = empData.data || {};
+
+        if (empData.isActive === false || empData.isDisabled === true || empData.isRelieved === true || empData.isBlocked === true || empData.status === 'relieved' || empData.status === 'terminated' || empData.status === 'rejected' || !!empData.deletedAt) {
+            console.warn(`[RESET] Blocked password reset for inactive/relieved employee ${employeeId}`);
+            throw new functions.https.HttpsError('permission-denied', 'This account is disabled or inactive. Relieved employees cannot reset passwords.');
+        }
+
+        const profileData = empData.profileData || empData.formData || {};
+        const storedData = empData.data || empData.formData || {};
 
         const NAME_FIELD = '7debf274-baee-4bac-a137-4b4b46719874';
         const MOBILE_FIELD = 'eb3617dc-9f1d-475d-a2db-005b6bc2500c';
@@ -965,11 +1040,17 @@ exports.verifyAndResetEmployeePassword = secureOnCall(async (request) => {
                 Object.values(profileData).some(val => typeof val === 'string' && normDigits(val).slice(-10) === inputMobile) ||
                 Object.values(storedData).some(val => typeof val === 'string' && normDigits(val).slice(-10) === inputMobile)
             ));
-        const matchAadhar = candidateAadhars.some(c => c && normDigits(c) === inputAadhar) ||
-            (inputAadhar.length >= 12 && (
-                Object.values(profileData).some(val => typeof val === 'string' && normDigits(val) === inputAadhar) ||
-                Object.values(storedData).some(val => typeof val === 'string' && normDigits(val) === inputAadhar)
-            ));
+        // Support both last 4 digits and full 12 digits for Aadhaar verification (UDF-AUD-52)
+        const matchAadhar = candidateAadhars.some(c => {
+            if (!c) return false;
+            const digits = normDigits(c);
+            return digits === inputAadhar || (inputAadhar.length === 4 && digits.endsWith(inputAadhar));
+        }) || (
+            (inputAadhar.length === 4 || inputAadhar.length >= 12) && (
+                Object.values(profileData).some(val => typeof val === 'string' && (normDigits(val) === inputAadhar || (inputAadhar.length === 4 && normDigits(val).endsWith(inputAadhar)))) ||
+                Object.values(storedData).some(val => typeof val === 'string' && (normDigits(val) === inputAadhar || (inputAadhar.length === 4 && normDigits(val).endsWith(inputAadhar))))
+            )
+        );
         const matchDob = candidateDobs.some(c => c && normDate(c) === inputDob) ||
             (inputDob.length >= 8 && (
                 Object.values(profileData).some(val => typeof val === 'string' && normDate(val) === inputDob) ||
@@ -1005,6 +1086,10 @@ exports.verifyAndResetEmployeePassword = secureOnCall(async (request) => {
             }
         }
         await batch.commit();
+        const authUid = empData.linkedUid || empData.uid || (empRef.id && empRef.id.length > 20 ? empRef.id : null);
+        if (authUid) {
+            await admin.auth().revokeRefreshTokens(authUid).catch(() => {});
+        }
 
         return { success: true, message: 'Password reset successfully' };
 
@@ -1030,6 +1115,9 @@ exports.changeEmployeePassword = secureOnCall(async (request) => {
 
     if (!employeeId || !currentPassword || !newPassword) {
         throw new functions.https.HttpsError('invalid-argument', 'Missing required fields');
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 6 || newPassword.length > 72) {
+        throw new functions.https.HttpsError('invalid-argument', 'New password must be between 6 and 72 characters.');
     }
 
     try {
@@ -1058,9 +1146,20 @@ exports.changeEmployeePassword = secureOnCall(async (request) => {
             throw new functions.https.HttpsError('not-found', 'Employee not found');
         }
 
-        // SECURITY: Verify caller owns this employee profile
+        if (empData.isDisabled === true || empData.isActive === false || empData.status === 'relieved' || empData.status === 'terminated') {
+            throw new functions.https.HttpsError('permission-denied', 'Account is disabled. Password change rejected.');
+        }
+
+        // SECURITY: Verify caller owns this employee profile (supports Google UID, portal ID, doc ID)
         const callerUid = request.auth.uid;
-        if (empData.uid !== callerUid && empData.linkedUid !== callerUid) {
+        const callerEmail = (request.auth.token && request.auth.token.email ? request.auth.token.email : '').toLowerCase().trim();
+        const isOwner = empData.uid === callerUid ||
+            empData.linkedUid === callerUid ||
+            empData.googleUid === callerUid ||
+            empData.portalId === callerUid ||
+            docRef.id === callerUid ||
+            (callerEmail && empData.linkedGoogleEmail && empData.linkedGoogleEmail.toLowerCase().trim() === callerEmail);
+        if (!isOwner) {
             throw new functions.https.HttpsError('permission-denied', 'You do not have permission to change this password.');
         }
 
@@ -1073,8 +1172,10 @@ exports.changeEmployeePassword = secureOnCall(async (request) => {
         // All employees must use their hashed password or go through reset flow.
 
         if (!isVerified) {
+            await recordFailedAttempt(db, `pwchange_${callerUid}`).catch(() => {});
             throw new functions.https.HttpsError('permission-denied', 'Incorrect current password');
         }
+        await clearFailedAttempts(db, `pwchange_${callerUid}`).catch(() => {});
 
         // Hash new password with bcrypt and remove legacy plain-text password
         const newHash = await hashPassword(newPassword);
@@ -1096,6 +1197,11 @@ exports.changeEmployeePassword = secureOnCall(async (request) => {
         allEmps.docs.forEach(d => batch.update(d.ref, updatePayload));
         await batch.commit();
 
+        const authUid = empData.linkedUid || empData.uid || (docRef.id && docRef.id.length > 20 ? docRef.id : null) || callerUid;
+        if (authUid) {
+            await admin.auth().revokeRefreshTokens(authUid).catch(() => {});
+        }
+
         return { success: true };
     } catch (error) {
         console.error('Error changing password:', error);
@@ -1113,7 +1219,10 @@ exports.linkEmployeeGoogleAccount = secureOnCall(async (request) => {
         employeeId = employeeId.trim().toUpperCase();
     }
 
-    // Verify Google ID Token if passed, or verify request.auth context
+    // Verify Google ID Token cryptographically
+    if (!idToken && (!request.auth || !request.auth.uid)) {
+        throw new functions.https.HttpsError('unauthenticated', 'Google authentication token is required');
+    }
     if (idToken) {
         try {
             const decodedToken = await admin.auth().verifyIdToken(idToken);
@@ -1123,7 +1232,7 @@ exports.linkEmployeeGoogleAccount = secureOnCall(async (request) => {
             console.error('Failed to verify Google ID token:', tokErr);
             throw new functions.https.HttpsError('unauthenticated', 'Invalid Google authentication token');
         }
-    } else if (!googleUid && request.auth && request.auth.uid) {
+    } else if (request.auth && request.auth.uid) {
         googleUid = request.auth.uid;
         if (request.auth.token && request.auth.token.email) {
             email = request.auth.token.email;
@@ -1220,10 +1329,10 @@ exports.linkEmployeeGoogleAccount = secureOnCall(async (request) => {
             throw new functions.https.HttpsError('permission-denied', 'Incorrect password');
         }
 
-        // Link Google UID across both collections
+        // Link Google UID across both collections (preserves primary uid and passwordHash)
         const linkPayload = {
-            uid: googleUid,
             linkedUid: googleUid,
+            googleUid: googleUid,
             authProvider: 'google',
             linkedGoogleEmail: email
         };
@@ -1313,9 +1422,20 @@ exports.verifyEmployeePassword = secureOnCall(async (request) => {
 
 // 5. Unlink Google Account
 exports.unlinkEmployeeGoogleAccount = secureOnCall(async (request) => {
-    // 1. Security Gate: Must be an authenticated session
+    // 1. Security Gate: Must be an authenticated Admin session (Google linking is locked and can only be changed/removed by an Admin)
     if (!request.auth || !request.auth.uid) {
-        throw new functions.https.HttpsError('unauthenticated', 'You must be logged into your account to unlink Google.');
+        throw new functions.https.HttpsError('unauthenticated', 'You must be logged into an administrator account to unlink Google.');
+    }
+
+    const isCallerAdmin = request.auth.token && (
+        request.auth.token.isSuperAdmin === true ||
+        request.auth.token.isAdmin === true ||
+        request.auth.token.role === 'admin' ||
+        request.auth.token.portal === 'admin' ||
+        request.auth.token.portalType === 'management'
+    );
+    if (!isCallerAdmin) {
+        throw new functions.https.HttpsError('permission-denied', 'Google link is locked. Once linked, only an Admin can change or remove a linked Google account.');
     }
 
     let { employeeId, currentPassword } = request.data;
@@ -1422,29 +1542,41 @@ exports.setupEmployeePassword = secureOnCall(async (request) => {
 
         // Also check by employeeId field
         if (!docRef) {
-            const empQuery = await db.collection('employees')
-                .where('employeeId', '==', employeeId.trim().toUpperCase())
-                .where('uid', '==', callerUid)
-                .limit(1).get();
-            if (!empQuery.empty) {
-                docRef = empQuery.docs[0].ref;
-                collectionName = 'employees';
-            }
-        }
+            const cleanId = employeeId.trim().toUpperCase();
+            const [empQuery, subQuery] = await Promise.all([
+                db.collection('employees').where('employeeId', '==', cleanId).limit(5).get(),
+                db.collection('onboarding_submissions').where('employeeId', '==', cleanId).limit(5).get()
+            ]);
 
-        if (!docRef) {
-            const subQuery = await db.collection('onboarding_submissions')
-                .where('employeeId', '==', employeeId.trim().toUpperCase())
-                .where('uid', '==', callerUid)
-                .limit(1).get();
-            if (!subQuery.empty) {
-                docRef = subQuery.docs[0].ref;
-                collectionName = 'onboarding_submissions';
+            const matchedEmp = empQuery.docs.find(d => {
+                const data = d.data();
+                return d.id === callerUid || data.uid === callerUid || data.linkedUid === callerUid || data.portalId === callerUid;
+            });
+            if (matchedEmp) {
+                docRef = matchedEmp.ref;
+                collectionName = 'employees';
+            } else {
+                const matchedSub = subQuery.docs.find(d => {
+                    const data = d.data();
+                    return d.id === callerUid || data.uid === callerUid || data.linkedUid === callerUid || data.portalId === callerUid;
+                });
+                if (matchedSub) {
+                    docRef = matchedSub.ref;
+                    collectionName = 'onboarding_submissions';
+                }
             }
         }
 
         if (!docRef) {
             throw new functions.https.HttpsError('permission-denied', 'You can only set password for your own account');
+        }
+
+        const ownSnap = await docRef.get();
+        const ownData = ownSnap.data() || {};
+        const verifiedEmployeeId = String(ownData.employeeId || '').trim().toUpperCase();
+        const inputId = employeeId.trim().toUpperCase();
+        if (verifiedEmployeeId && verifiedEmployeeId !== inputId) {
+            throw new functions.https.HttpsError('permission-denied', 'Employee ID does not match your verified account.');
         }
 
         // Hash with bcrypt (secure, salted, slow)
@@ -1459,13 +1591,23 @@ exports.setupEmployeePassword = secureOnCall(async (request) => {
         const batch = db.batch();
         batch.update(docRef, updatePayload);
 
-        const cleanId = employeeId.trim().toUpperCase();
+        const cleanId = verifiedEmployeeId || inputId;
         const [allSubs, allEmps] = await Promise.all([
             db.collection('onboarding_submissions').where('employeeId', '==', cleanId).get(),
             db.collection('employees').where('employeeId', '==', cleanId).get()
         ]);
-        allSubs.docs.forEach(d => batch.update(d.ref, updatePayload));
-        allEmps.docs.forEach(d => batch.update(d.ref, updatePayload));
+        allSubs.docs.forEach(d => {
+            const data = d.data();
+            if (d.id === callerUid || data.uid === callerUid || data.linkedUid === callerUid || data.portalId === callerUid || data.employeeId === cleanId) {
+                batch.update(d.ref, updatePayload);
+            }
+        });
+        allEmps.docs.forEach(d => {
+            const data = d.data();
+            if (d.id === callerUid || data.uid === callerUid || data.linkedUid === callerUid || data.portalId === callerUid || data.employeeId === cleanId) {
+                batch.update(d.ref, updatePayload);
+            }
+        });
         await batch.commit();
 
         console.log(`[SETUP_PASSWORD] Password set for ${employeeId} in ${collectionName}`);
@@ -1485,7 +1627,7 @@ exports.selfLinkGoogleAccount = secureOnCall(async (request) => {
     let targetGoogleUid = request.data.googleUid;
     let targetEmail = request.data.email;
 
-    // Cryptographic verification if idToken is supplied
+    // Cryptographic verification of Google token signature
     if (request.data.googleIdToken) {
         try {
             const decodedToken = await admin.auth().verifyIdToken(request.data.googleIdToken);
@@ -1495,6 +1637,8 @@ exports.selfLinkGoogleAccount = secureOnCall(async (request) => {
             console.error('[selfLinkGoogleAccount] Token verification failed:', tokenErr);
             throw new functions.https.HttpsError('unauthenticated', 'Invalid Google token signature.');
         }
+    } else {
+        throw new functions.https.HttpsError('unauthenticated', 'Google authentication token is required');
     }
 
     const { employeeId } = request.data;
@@ -1557,16 +1701,14 @@ exports.selfLinkGoogleAccount = secureOnCall(async (request) => {
         // Check Google account conflict (make sure this Google account isn't used by another user)
         const normalizedGoogleEmail = email.toLowerCase().trim();
 
-        // 🛡️ SECURITY: Check if this email belongs to an Admin/Staff user via Firebase Auth API
+        // 🛡️ SECURITY: Check if this email belongs to an Admin/Staff user (UDF-AUD-45)
         try {
             const authUserRecord = await admin.auth().getUserByEmail(normalizedGoogleEmail);
             if (authUserRecord) {
-                const [empSnapByUid, subSnapByUid] = await Promise.all([
-                    db.collection('employees').where('uid', '==', authUserRecord.uid).limit(1).get(),
-                    db.collection('onboarding_submissions').where('linkedUid', '==', authUserRecord.uid).limit(1).get()
-                ]);
-                if (empSnapByUid.empty && subSnapByUid.empty) {
-                    throw new functions.https.HttpsError('already-exists', 'This Google account is already registered in our system. Please contact your administrator.');
+                // Only block if this email is an administrative staff account
+                const staffSnap = await db.collection('staff_accounts').doc(authUserRecord.uid).get();
+                if (staffSnap.exists) {
+                    throw new functions.https.HttpsError('already-exists', 'This Google account is associated with a staff account and cannot be linked to an employee profile.');
                 }
             }
         } catch (authError) {
@@ -1585,22 +1727,26 @@ exports.selfLinkGoogleAccount = secureOnCall(async (request) => {
 
         for (const snap of empChecks) {
             if (!snap.empty) {
-                const isOnlySelf = snap.docs.every(doc => doc.id === callerUid || doc.data().employeeId === employeeId);
+                const isOnlySelf = snap.docs.every(doc => 
+                    doc.id === callerUid || 
+                    doc.data().employeeId === employeeId ||
+                    doc.data().portalId === employeeId ||
+                    doc.data().uid === callerUid ||
+                    doc.data().linkedUid === callerUid
+                );
                 if (!isOnlySelf) {
                     throw new functions.https.HttpsError('already-exists', 'This Google account is already registered in our system. Please contact your administrator.');
                 }
             }
         }
 
-        // Link Google Account
+        // Link Google Account without wiping password or overwriting primary document uid
         const linkPayload = {
-            uid: googleUid,
             linkedUid: googleUid,
+            googleUid: googleUid,
             authProvider: 'google',
             linkedGoogleEmail: normalizedGoogleEmail,
-            isDefaultPassword: false,
-            passwordHash: '', // Clear manual password hash if linking Google
-            mockPassword: admin.firestore.FieldValue.delete() // Clear plain text password
+            isDefaultPassword: false
         };
 
         const batch = db.batch();
@@ -1675,9 +1821,19 @@ exports.adminControlEmployeeAuth = secureOnCall(async (request) => {
                 authProvider: 'manual'
             };
             await Promise.all(docRefs.map(ref => ref.update(updates)));
+            const prevUids = new Set();
+            if (!empSnap.empty) { const d = empSnap.docs[0].data(); if (d.uid) prevUids.add(d.uid); if (d.linkedUid && d.linkedUid !== 'none') prevUids.add(d.linkedUid); }
+            if (!subSnap.empty) { const d = subSnap.docs[0].data(); if (d.uid) prevUids.add(d.uid); if (d.linkedUid && d.linkedUid !== 'none') prevUids.add(d.linkedUid); }
+            docRefs.forEach(ref => { if (ref.id && ref.id.length > 20) prevUids.add(ref.id); });
+            for (const oldUid of prevUids) {
+                await admin.auth().revokeRefreshTokens(oldUid).catch(() => {});
+            }
             return { success: true };
         } 
         else if (action === 'unlink_google') {
+            const prevUids = new Set();
+            if (!empSnap.empty) { const d = empSnap.docs[0].data(); if (d.uid) prevUids.add(d.uid); if (d.linkedUid && d.linkedUid !== 'none') prevUids.add(d.linkedUid); }
+            if (!subSnap.empty) { const d = subSnap.docs[0].data(); if (d.uid) prevUids.add(d.uid); if (d.linkedUid && d.linkedUid !== 'none') prevUids.add(d.linkedUid); }
             const updates = {
                 uid: admin.firestore.FieldValue.delete(),
                 linkedUid: 'none',
@@ -1685,6 +1841,10 @@ exports.adminControlEmployeeAuth = secureOnCall(async (request) => {
                 linkedGoogleEmail: admin.firestore.FieldValue.delete()
             };
             await Promise.all(docRefs.map(ref => ref.update(updates)));
+            for (const oldUid of prevUids) {
+                await admin.auth().setCustomUserClaims(oldUid, {}).catch(() => {});
+                await admin.auth().revokeRefreshTokens(oldUid).catch(() => {});
+            }
             return { success: true };
         }
         else if (action === 'link_google_email') {
@@ -1728,15 +1888,20 @@ exports.adminControlEmployeeAuth = secureOnCall(async (request) => {
                 const fullName = sourceData.applicantName || sourceData.name || 'user';
                 const firstName = fullName.split(' ')[0].toLowerCase().replace(/[^a-z0-9]/g, '');
                 
-                // Get DOB year: search in data object for any date-of-birth field
+                // Get DOB year: search in data object for Form Builder UUID 6e570a01-14e0-4e18-b112-97ddc51d0778 or any date-of-birth field
                 let year = '123';
-                const dataObj = sourceData.data || sourceData.formData || {};
-                for (const [key, val] of Object.entries(dataObj)) {
-                    if (typeof val === 'string' && val.match(/^\d{4}-\d{2}-\d{2}$/)) {
-                        const keyLower = key.toLowerCase();
-                        if (keyLower.includes('birth') || keyLower.includes('dob')) {
-                            year = val.split('-')[0];
-                            break;
+                const dataObj = { ...(sourceData.data || {}), ...(sourceData.formData || {}), ...(sourceData.profileData || {}) };
+                const directDob = dataObj['6e570a01-14e0-4e18-b112-97ddc51d0778'] || sourceData.dob || sourceData.dateOfBirth;
+                if (typeof directDob === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(directDob)) {
+                    year = directDob.split('-')[0];
+                } else {
+                    for (const [key, val] of Object.entries(dataObj)) {
+                        if (typeof val === 'string' && val.match(/^\d{4}-\d{2}-\d{2}$/)) {
+                            const keyLower = key.toLowerCase();
+                            if (keyLower.includes('birth') || keyLower.includes('dob')) {
+                                year = val.split('-')[0];
+                                break;
+                            }
                         }
                     }
                 }
@@ -1751,7 +1916,8 @@ exports.adminControlEmployeeAuth = secureOnCall(async (request) => {
                         }
                     }
                 }
-                const phoneOrAadhaar = sourceData.phoneNumber || sourceData.aadhaarNumber || '';
+                const phoneOrAadhaar = sourceData.phoneNumber || sourceData.contactNumber || sourceData.aadhaarNumber || sourceData.aadharNumber ||
+                    dataObj['eb3617dc-9f1d-475d-a2db-005b6bc2500c'] || dataObj['18855ee9-0d66-41d6-988b-128b776a8c5b'] || '';
                 const cleanSuffix = (phoneOrAadhaar || '').replace(/\D/g, '').slice(-4);
                 tempPassword = `${firstName}${year}${cleanSuffix ? '@' + cleanSuffix : ''}`;
             }
@@ -1764,6 +1930,13 @@ exports.adminControlEmployeeAuth = secureOnCall(async (request) => {
                 authProvider: 'manual'
             };
             await Promise.all(docRefs.map(ref => ref.update(updates)));
+            const prevUids = new Set();
+            if (!empSnap.empty) { const d = empSnap.docs[0].data(); if (d.uid) prevUids.add(d.uid); if (d.linkedUid && d.linkedUid !== 'none') prevUids.add(d.linkedUid); }
+            if (!subSnap.empty) { const d = subSnap.docs[0].data(); if (d.uid) prevUids.add(d.uid); if (d.linkedUid && d.linkedUid !== 'none') prevUids.add(d.linkedUid); }
+            docRefs.forEach(ref => { if (ref.id && ref.id.length > 20) prevUids.add(ref.id); });
+            for (const oldUid of prevUids) {
+                await admin.auth().revokeRefreshTokens(oldUid).catch(() => {});
+            }
             return { success: true, generatedPassword: tempPassword };
         }
         else {
@@ -2235,6 +2408,9 @@ exports.moveStorageFolder = secureOnCall(async (request) => {
     if (!sourcePath || !destinationPath) {
         throw new functions.https.HttpsError('invalid-argument', 'sourcePath and destinationPath are required.');
     }
+    if (sourcePath.includes('..') || destinationPath.includes('..')) {
+        throw new functions.https.HttpsError('invalid-argument', 'Path traversal is not permitted.');
+    }
 
     try {
         const db = admin.firestore();
@@ -2298,8 +2474,8 @@ exports.moveStorageFolder = secureOnCall(async (request) => {
             const destParts = cleanDest.split('/');
             const destId = destParts[1];
 
-            const ownsSource = (sourceId && allowedIds.has(sourceId)) || cleanSource.includes(uid);
-            const ownsDest = (destId && allowedIds.has(destId)) || cleanDest.includes(uid);
+            const ownsSource = ['onboarding', 'employees', 'draft_submissions'].includes(sourceParts[0]) && !!sourceId && allowedIds.has(sourceId);
+            const ownsDest = ['onboarding', 'employees', 'draft_submissions'].includes(destParts[0]) && !!destId && allowedIds.has(destId);
 
             if (!ownsSource || !ownsDest) {
                 console.warn(`[SECURITY] IDOR file move blocked: User ${uid} attempted moving "${sourcePath}" to "${destinationPath}"`);
@@ -2540,11 +2716,11 @@ exports.getStorageFolderSizeServer = secureOnCall(async (request) => {
             ]);
             if (draftSnap.exists) {
                 const dd = draftSnap.data();
-                if (!dd.ownerUid || dd.ownerUid === uid || dd.linkedUid === uid || dd.activeSessionUid === uid || !dd.isGoogleDraft) isAuthorized = true;
+                if (dd.ownerUid === uid || dd.linkedUid === uid || dd.activeSessionUid === uid) isAuthorized = true;
             }
             if (!isAuthorized && subSnap.exists) {
                 const sd = subSnap.data();
-                if (sd.uid === uid || sd.linkedUid === uid || sd.ownerUid === uid || sd.activeCorrectionToken) isAuthorized = true;
+                if (sd.uid === uid || sd.linkedUid === uid || sd.ownerUid === uid) isAuthorized = true;
             }
         }
     } else if (!isAuthorized && cleanPath.startsWith('employees/')) {
@@ -2694,8 +2870,9 @@ exports.autoDeleteRecycleBin = onSchedule({
                 console.log(`[CRON] Wiped Firebase Storage folder for ${docSnap.id} and associated applicant folders`);
             }
 
-            // 2. Cascade delete requests
+            // 2. Cascade delete requests across both doc ID and badge ID (UDF-AUD-56)
             const deleteAssociated = async (id) => {
+                if (!id) return;
                 const reqCollections = ['leave_requests', 'account_updates', 'resignations', 'disciplinary_actions', '_auth_attempts'];
                 for (const reqCol of reqCollections) {
                     const q = db.collection(reqCol).where('employeeId', '==', id);
@@ -2706,8 +2883,25 @@ exports.autoDeleteRecycleBin = onSchedule({
             };
             
             await deleteAssociated(uniqueId);
+            if (data.employeeId && data.employeeId !== uniqueId) {
+                await deleteAssociated(data.employeeId);
+            }
+            if (data.submissionId && data.submissionId !== uniqueId) {
+                await deleteAssociated(data.submissionId);
+            }
             if (collectionName === 'onboarding_submissions' && docSnap.id.startsWith('SUB-')) {
                 await deleteAssociated(docSnap.id);
+            }
+
+            // Cascade delete or disable Firebase Auth account to prevent orphaned logins
+            const authUid = data.linkedUid || data.uid || data.ownerUid || data.portalId;
+            if (authUid && authUid.length > 5) {
+                try {
+                    await admin.auth().deleteUser(authUid);
+                    console.log(`[CRON] Deleted Firebase Auth user ${authUid} for ${uniqueId}`);
+                } catch (authErr) {
+                    // Non-fatal if user already deleted
+                }
             }
 
             // 3. Delete the main document
@@ -2800,7 +2994,7 @@ exports.processNoticePeriodExitsCron = onSchedule({
 }, async (event) => {
     console.log('[CRON: processNoticePeriodExitsCron] Starting notice period exit check...');
     const db = admin.firestore();
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
 
     try {
         const snap = await db.collection('employees')
@@ -2827,6 +3021,8 @@ exports.processNoticePeriodExitsCron = onSchedule({
                     isActive: false,
                     status: 'Relieved',
                     isRelieved: true,
+                    assignedSiteIds: [],
+                    activeAssignments: [],
                     resignationStatus: 'Relieved',
                     relievingDate: relDateStr,
                     relievingReason: data.relievingReason || 'Notice Period Completed',
@@ -2841,10 +3037,29 @@ exports.processNoticePeriodExitsCron = onSchedule({
                         isActive: false,
                         status: 'Relieved',
                         isRelieved: true,
+                        assignedSiteIds: [],
+                        activeAssignments: [],
                         relievingDate: relDateStr,
                         relievingReason: data.relievingReason || 'Notice Period Completed',
                         relievingRemarks: 'Automated midnight exit upon notice period completion'
                     });
+                }
+
+                // Sync corresponding resignation record to isProcessed: true
+                try {
+                    const resSnap = await db.collection('resignations')
+                        .where('employeeId', 'in', [data.employeeId, doc.id])
+                        .where('status', '==', 'Approved')
+                        .where('isProcessed', '==', false)
+                        .get();
+                    resSnap.forEach(rDoc => {
+                        batch.update(rDoc.ref, {
+                            isProcessed: true,
+                            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        });
+                    });
+                } catch (resErr) {
+                    console.warn(`[CRON: processNoticePeriodExitsCron] Could not mark resignation processed:`, resErr.message);
                 }
 
                 // Disable Firebase Auth account
@@ -2861,7 +3076,9 @@ exports.processNoticePeriodExitsCron = onSchedule({
                 const auditRef = db.collection('audit_logs').doc();
                 batch.set(auditRef, {
                     action: 'RESIGNATION_NOTICE_EXIT',
+                    actionType: 'STATUS_CHANGE',
                     module: 'RESIGNATIONS',
+                    targetModule: 'RESIGNATIONS',
                     targetId: doc.id,
                     actorId: 'system_cron',
                     actorName: 'System (processNoticePeriodExitsCron)',
@@ -2956,28 +3173,31 @@ exports.claimEmployeeProfile = secureOnCall(async (request) => {
             return null;
         };
 
-        // 4. Find the legacy import record (case-insensitive lookup: try uppercase first, then fallback to raw trimmed)
+        // 4. Find the legacy import record (allows re-claim if interrupted by the same user)
         const normalizedEmpId = trimmedId.toUpperCase();
         let legacySnap = await db.collection('legacy_employee_imports')
             .where('employeeId', '==', normalizedEmpId)
-            .where('claimed', '==', false)
             .limit(1)
             .get();
 
         if (legacySnap.empty && normalizedEmpId !== trimmedId) {
             legacySnap = await db.collection('legacy_employee_imports')
                 .where('employeeId', '==', trimmedId)
-                .where('claimed', '==', false)
                 .limit(1)
                 .get();
         }
 
         if (legacySnap.empty) {
-            throw new functions.https.HttpsError('not-found', 'No unclaimed profile found with this Employee ID. It may have already been claimed, or the ID is incorrect.');
+            throw new functions.https.HttpsError('not-found', 'No profile found with this Employee ID. Please check the ID or contact HR.');
         }
 
         const legacyDoc = legacySnap.docs[0];
         const legacyData = legacyDoc.data();
+
+        // If already claimed, check if it was claimed by someone else
+        if (legacyData.claimed === true && legacyData.claimedByUid && currentUid && legacyData.claimedByUid !== currentUid) {
+            throw new functions.https.HttpsError('already-exists', 'This profile has already been claimed by another account. Please contact HR.');
+        }
 
         // 5. Verify ALL enabled metrics
         for (const metric of metrics) {
@@ -3004,6 +3224,14 @@ exports.claimEmployeeProfile = secureOnCall(async (request) => {
                 const pYMD = parseDateToYMD(providedValue);
                 if (!sYMD || !pYMD || sYMD !== pYMD) {
                     throw new functions.https.HttpsError('permission-denied', `Verification failed. The ${metric} you entered does not match our records.`);
+                }
+            } else if (metric === 'bankAccount') {
+                // Support both full account number and last 4 digits (UDF-AUD-51)
+                const normStored = normalize(storedValue);
+                const normProvided = normalize(providedValue);
+                const isMatch = normStored === normProvided || (normProvided.length >= 4 && normStored.endsWith(normProvided));
+                if (!isMatch) {
+                    throw new functions.https.HttpsError('permission-denied', 'Verification failed. The Bank Account details you entered do not match our records.');
                 }
             } else if (!providedValue || normalize(storedValue) !== normalize(providedValue)) {
                 throw new functions.https.HttpsError('permission-denied', `Verification failed. The ${metric} you entered does not match our records.`);
@@ -3078,8 +3306,8 @@ exports.getSystemMetrics = secureOnCall(async (request) => {
     const token = request.auth.token || {};
 
     try {
-        // Authenticate admin check
-        let isAdmin = token.isAdmin === true || token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+        // Authenticate admin check - strictly SuperAdmin for system-wide infrastructure metrics
+        let isAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
         if (!isAdmin) {
             const [adminSnap, staffSnap] = await Promise.all([
                 db.collection('users').doc(callerUid).get(),
@@ -3200,8 +3428,8 @@ exports.getSystemMetrics = secureOnCall(async (request) => {
             storageDownloads: Math.round((reads || 0) * 0.15),
             storageEgress: egress || 0,
             invocations: executions || 0,
-            buildMinutes: 5.2,
-            containerStorage: 180 * 1024 * 1024
+            buildMinutes: 0,
+            containerStorage: storageBytes || 0
         };
 
     } catch (error) {
@@ -3210,33 +3438,10 @@ exports.getSystemMetrics = secureOnCall(async (request) => {
     }
 });
 
-// Shared IP rate limiting for public unauthenticated lookup endpoints (max 10 requests per minute per IP)
-const lookupRateLimits = new Map();
-
-function checkLookupRateLimit(ip) {
-    const now = Date.now();
-    const windowMs = 60 * 1000; // 1 minute
-    const maxAttempts = 10;
-
-    let record = lookupRateLimits.get(ip);
-    if (!record || now - record.startTime > windowMs) {
-        record = { count: 1, startTime: now };
-        lookupRateLimits.set(ip, record);
-        return true;
-    }
-
-    if (record.count >= maxAttempts) {
-        return false;
-    }
-
-    record.count++;
-    return true;
-}
-
 // Secure check for employee status during Forgot Password flow with IP rate-limiting (Finding 3)
 exports.checkForgotPasswordEmployeeStatus = secureOnCall(async (request) => {
     const rawReq = request.rawRequest;
-    const clientIp = (rawReq && (rawReq.headers['x-forwarded-for'] || rawReq.ip || rawReq.connection?.remoteAddress)) || 'unknown-client';
+    const clientIp = (rawReq && (rawReq.ip || rawReq.connection?.remoteAddress)) || 'unknown-client';
     const cleanIp = typeof clientIp === 'string' ? clientIp.split(',')[0].trim() : 'unknown-client';
 
     if (!checkLookupRateLimit(cleanIp)) {
@@ -3412,6 +3617,11 @@ exports.recordReferralMetricServer = secureOnCall(async (request) => {
         throw new functions.https.HttpsError('invalid-argument', 'Invalid referral metric.');
     }
 
+    // joined metric requires an authenticated user/candidate context to prevent unauthenticated spoofing (UDF-AUD-12)
+    if (metric === 'joined' && !request.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Authentication required to record referral join.');
+    }
+
     const rawReq = request.rawRequest;
     const clientIp = (rawReq && (rawReq.headers['x-forwarded-for'] || rawReq.ip || rawReq.connection?.remoteAddress)) || 'unknown-client';
     const cleanIp = typeof clientIp === 'string' ? clientIp.split(',')[0].trim() : 'unknown-client';
@@ -3488,6 +3698,9 @@ exports.syncStaffGoogleLogin = secureOnCall(async (request) => {
                 originalDocId: originalDoc.id,
                 syncedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
+            if (originalDoc.id !== uid) {
+                await originalDoc.ref.delete();
+            }
 
             return { success: true, syncedUid: uid };
         }
@@ -3506,6 +3719,9 @@ exports.syncStaffGoogleLogin = secureOnCall(async (request) => {
                 originalDocId: originalUser.id,
                 syncedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
+            if (originalUser.id !== uid) {
+                await originalUser.ref.delete();
+            }
             return { success: true, syncedUid: uid };
         }
 
@@ -3703,42 +3919,126 @@ exports.getUploadUrl = secureOnCall(async (request) => {
 
             if (employeeId === uid) {
                 isAuthorized = true;
+            } else if (request.auth.token && (request.auth.token.isSuperAdmin === true || request.auth.token.isAdmin === true)) {
+                isAuthorized = true;
             } else {
-                let empDoc = await db.collection('employees').doc(employeeId).get();
-                if (!empDoc.exists) {
-                    const snap = await db.collection('employees').where('employeeId', '==', employeeId).limit(1).get();
-                    if (!snap.empty) {
-                        empDoc = snap.docs[0];
-                    } else {
-                        const snap2 = await db.collection('employees').where('portalId', '==', employeeId).limit(1).get();
-                        if (!snap2.empty) empDoc = snap2.docs[0];
+                // Check staff_accounts (UDF-AUD-15)
+                const staffCheck = await db.collection('staff_accounts').doc(employeeId).get();
+                if (staffCheck.exists) {
+                    const sData = staffCheck.data() || {};
+                    if (
+                        (sData.email && request.auth.token.email && sData.email.toLowerCase() === request.auth.token.email.toLowerCase()) ||
+                        sData.uid === uid ||
+                        sData.userId === uid ||
+                        staffCheck.id === uid
+                    ) {
+                        isAuthorized = true;
                     }
                 }
-                if (empDoc.exists) {
-                    const e = empDoc.data();
-                    if (e.linkedUid === uid || e.uid === uid || e.portalId === uid || e.employeeId === uid || empDoc.id === uid) {
-                        isAuthorized = true;
+
+                if (!isAuthorized) {
+                    let empDoc = await db.collection('employees').doc(employeeId).get();
+                    if (!empDoc.exists) {
+                        const snap = await db.collection('employees').where('employeeId', '==', employeeId).limit(1).get();
+                        if (!snap.empty) {
+                            empDoc = snap.docs[0];
+                        } else {
+                            const snap2 = await db.collection('employees').where('portalId', '==', employeeId).limit(1).get();
+                            if (!snap2.empty) empDoc = snap2.docs[0];
+                        }
+                    }
+                    if (empDoc && empDoc.exists) {
+                        const e = empDoc.data();
+                        if (e.linkedUid === uid || e.uid === uid || e.portalId === uid || e.employeeId === uid || empDoc.id === uid) {
+                            isAuthorized = true;
+                        }
                     }
                 }
             }
         }
 
         // ── CONTEXT: admin ────────────────────────────────────────────────────
-        // Admin uploading documents (BGV certs, employee docs, public assets)
+        // Admin uploading documents (BGV certs, employee docs, public assets) (UDF-AUD-234)
         else if (context === 'admin') {
-            // Check custom claims first (fastest)
-            if (request.auth.token && (request.auth.token.isAdmin || request.auth.token.isSuperAdmin)) {
+            const isSuperAdmin = request.auth.token && (request.auth.token.isSuperAdmin === true || request.auth.token.roleId === 'role-super-admin' || request.auth.token.roleId === 'super-admin');
+            if (isSuperAdmin) {
                 isAuthorized = true;
             } else {
-                // Check if caller is an active admin/staff in Firestore
-                const [userSnap, staffAccSnap] = await Promise.all([
-                    db.collection('users').doc(uid).get(),
-                    db.collection('staff_accounts').doc(uid).get()
-                ]);
+                const permissions = Array.isArray(request.auth.token?.permissions) ? request.auth.token.permissions : [];
+                // If uploading to public/* assets, require MANAGE_SYSTEM or MANAGE_WEBSITE
+                if (storagePath.startsWith('public/')) {
+                    if (permissions.includes('MANAGE_SYSTEM') || permissions.includes('MANAGE_WEBSITE')) {
+                        isAuthorized = true;
+                    }
+                } else if (storagePath.startsWith('employees/')) {
+                    const pathParts = storagePath.split('/');
+                    const targetEmpId = pathParts[1];
+                    const subFolder = pathParts[2] || '';
 
-                const adminDoc = staffAccSnap.exists ? staffAccSnap.data() : (userSnap.exists ? userSnap.data() : null);
-                if (adminDoc && adminDoc.isDisabled !== true && adminDoc.isActive !== false) {
-                    isAuthorized = true;
+                    // Resolve caller staff doc
+                    const [staffSnap, saSnap] = await Promise.all([
+                        db.collection('staff').doc(uid).get(),
+                        db.collection('staff_accounts').doc(uid).get()
+                    ]);
+                    const staffDoc = saSnap.exists ? saSnap.data() : (staffSnap.exists ? staffSnap.data() : null);
+                    if (staffDoc && staffDoc.isDisabled !== true && staffDoc.isActive !== false) {
+                        const roleId = staffDoc.roleId || '';
+                        const isVendor = roleId === 'role-bgv-vendor' || permissions.includes('BGV_VENDOR');
+
+                        if (isVendor) {
+                            // Vendors may only upload to /bgv/ subfolder for their assigned BGV cases
+                            if (subFolder === 'bgv') {
+                                const bgvSnap = await db.collection('bgv_records').where('employeeId', '==', targetEmpId).limit(1).get();
+                                if (!bgvSnap.empty) {
+                                    const bgvData = bgvSnap.docs[0].data();
+                                    const vendorName = (staffDoc.name || staffDoc.username || '').toLowerCase();
+                                    if (
+                                        bgvData.vendorId === uid ||
+                                        (bgvData.vendorName && vendorName && bgvData.vendorName.toLowerCase().includes(vendorName))
+                                    ) {
+                                        isAuthorized = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            // Staff upload: verify site scoping or global permissions
+                            const hasGlobal = permissions.includes('EMPLOYEES_VIEW_SCOPE_ALL') ||
+                                permissions.includes('BGV_VIEW_SCOPE_ALL') ||
+                                permissions.includes('MANAGE_SITES') ||
+                                permissions.includes('MANAGE_ALL_SITES');
+                            if (hasGlobal) {
+                                isAuthorized = true;
+                            } else {
+                                const sitesManaged = Array.isArray(staffDoc.sitesManaged) ? staffDoc.sitesManaged : [];
+                                const empSnap = await resolveEmployeeDocAdmin(db, targetEmpId);
+                                if (empSnap && empSnap.exists) {
+                                    const empData = empSnap.data();
+                                    const empSite = empData.currentSiteId || empData.siteId || '';
+                                    if (empSite && sitesManaged.includes(empSite)) {
+                                        isAuthorized = true;
+                                    }
+                                } else {
+                                    const subSnap = await db.collection('onboarding_submissions').doc(targetEmpId).get();
+                                    if (subSnap.exists) {
+                                        const subSite = subSnap.data().siteId || '';
+                                        if (subSite && sitesManaged.includes(subSite)) {
+                                            isAuthorized = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Other general admin assets
+                    const [userSnap, staffAccSnap] = await Promise.all([
+                        db.collection('users').doc(uid).get(),
+                        db.collection('staff_accounts').doc(uid).get()
+                    ]);
+                    const adminDoc = staffAccSnap.exists ? staffAccSnap.data() : (userSnap.exists ? userSnap.data() : null);
+                    if (adminDoc && adminDoc.isDisabled !== true && adminDoc.isActive !== false) {
+                        isAuthorized = true;
+                    }
                 }
             }
         }
@@ -3827,7 +4127,7 @@ const computeAndApplyUserClaims = async (uid, resolvedDocId = null, explicitDoc 
     }
 
     const roleId = doc.roleId || 'none';
-    const isSuperAdmin = roleId === 'role-super-admin' || !!userDoc || doc.type === 'Admin' || (doc.roles && doc.roles.includes('super-admin'));
+    const isSuperAdmin = roleId === 'role-super-admin' || roleId === 'super-admin' || !!userDoc || doc.type === 'Admin' || (doc.roles && doc.roles.includes('super-admin'));
 
     // Resolve all sites managed
     const sitesManagedSet = new Set(Array.isArray(doc.sitesManaged) ? doc.sitesManaged.filter(Boolean) : []);
@@ -3866,21 +4166,28 @@ const computeAndApplyUserClaims = async (uid, resolvedDocId = null, explicitDoc 
     ])];
 
     // Master permission set checked by firestore.rules
-    // Keeping only rules-relevant permissions prevents breaching Google's 1,000-byte custom claims limit
+    // Keeping only rules-relevant permissions prevents breaching Google's 1,000-byte custom claims limit (UDF-AUD-30)
     const FIRESTORE_RULES_PERMS = new Set([
         'EMPLOYEES_VIEW_SCOPE_ALL', 'SUBMISSIONS_VIEW_SCOPE_ALL', 'LEAVES_VIEW_SCOPE_ALL',
         'ACCOUNT_UPDATES_VIEW_SCOPE_ALL', 'RESIGNATIONS_VIEW_SCOPE_ALL', 'DISCIPLINE_VIEW_SCOPE_ALL',
         'MANAGE_SITES', 'MANAGE_ALL_SITES', 'SITES_MANAGE', 'SITES_EDIT_INFO', 'SITES_DELETE',
-        'SUBMISSIONS_APPROVE', 'DELETE_SUBMISSION', 'DELETE_EMPLOYEE', 'EMPLOYEES_IMPORT',
+        'SUBMISSIONS_APPROVE', 'SUBMISSIONS_REJECT', 'SUBMISSIONS_ADD_COMMENTS', 'SUBMISSIONS_EDIT_COMMENTS',
+        'SUBMISSIONS_REVERT_DECISION', 'SUBMISSIONS_CREATE_CORRECTION_LINK', 'SUBMISSIONS_VIEW_CORRECTION_LINKS',
+        'DELETE_SUBMISSION', 'DELETE_EMPLOYEE', 'EMPLOYEES_IMPORT',
         'EMPLOYEES_MANAGE_DEPLOYMENTS', 'EMPLOYEES_MANAGE_CLIENT_IDS', 'EMPLOYEES_REQUEST_CORRECTION',
-        'EMPLOYEES_MARK_PROFILE_COMPLETE', 'EMPLOYEES_TAB_RECYCLE_BIN', 'LEAVES_APPROVE', 'LEAVES_DELETE',
+        'EMPLOYEES_MARK_PROFILE_COMPLETE', 'EMPLOYEES_TAB_RECYCLE_BIN', 'EMPLOYEES_CORRECT_ID',
+        'LEAVES_APPROVE', 'LEAVES_DELETE', 'LEAVES_MANAGE_BALANCES',
         'MANAGE_LEAVE_TYPES', 'ACCOUNT_UPDATES_APPROVE', 'ACCOUNT_UPDATES_DELETE', 'RESIGNATIONS_APPROVE',
         'RESIGNATIONS_DELETE', 'MANAGE_SYSTEM', 'MANAGE_WORKFLOWS', 'MANAGE_FORMS', 'MANAGE_FORM_SECTIONS',
+        'MANAGE_ROLES', 'MANAGE_STAFF',
         'VIEW_AUDIT_LOGS', 'BGV_VIEW', 'BGV_VIEW_DOSSIER', 'BGV_MANAGE', 'BGV_DISPATCH_VENDOR',
-        'BGV_UPLOAD_CERTIFICATE', 'BGV_APPROVE_REJECT', 'BGV_VENDOR', 'BGV_CONFIGURE_FIELDS',
+        'BGV_UPLOAD_CERTIFICATE', 'BGV_APPROVE_REJECT', 'BGV_VENDOR', 'BGV_CONFIGURE_FIELDS', 'BGV_VIEW_SCOPE_ALL',
         'INVITES_CREATE', 'INVITES_MANAGE', 'INVITES_EDIT', 'INVITES_REACTIVATE', 'INVITES_DELETE',
-        'INVITES_VIEW_ALL', 'VACANCIES_MANAGE', 'DISCIPLINE_MANAGE', 'DISCIPLINE_CREATE',
-        'DISCIPLINE_ISSUE', 'DISCIPLINE_DELETE', 'GAMIFICATION_MANAGE'
+        'INVITES_VIEW_ALL', 'VACANCIES_MANAGE', 'VACANCIES_POST', 'DISCIPLINE_MANAGE', 'DISCIPLINE_CREATE',
+        'DISCIPLINE_ISSUE', 'DISCIPLINE_DELETE', 'GAMIFICATION_MANAGE',
+        'EMPLOYEES_ACTION_RELIEVE', 'EMPLOYEES_ACTION_REJOIN', 'EMPLOYEES_ACTION_RESTORE', 'EMPLOYEES_EDIT_PROFILE', 'EMPLOYEES_MANAGE_SECURITY',
+        'GRIEVANCES_VIEW', 'GRIEVANCES_VIEW_SCOPE_ALL', 'GRIEVANCES_RESOLVE', 'GRIEVANCES_DELETE',
+        'REWARDS_VIEW', 'REWARDS_MANAGE'
     ]);
 
     // SuperAdmin already bypasses all rules (isSuperAdmin: true), so permissions array can be empty in claims
@@ -3921,7 +4228,7 @@ exports.setAdminClaims = secureOnCall(async (request) => {
         throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated.');
     }
     const uid = request.auth.uid;
-    const email = (request.auth.token && request.auth.token.email) ? request.auth.token.email.toLowerCase().trim() : '';
+    const email = (request.auth.token && request.auth.token.email && request.auth.token.email_verified === true) ? request.auth.token.email.toLowerCase().trim() : '';
     const db = admin.firestore();
 
     // 1. Strict Server-Side Verification: Verify caller against staff_accounts or users
@@ -3978,11 +4285,6 @@ exports.refreshAdminClaims = secureOnCall(async (request) => {
         throw new functions.https.HttpsError('invalid-argument', 'targetUid is required.');
     }
 
-    const isSuperAdmin = request.auth.token && request.auth.token.isSuperAdmin === true;
-    if (!isSuperAdmin && callerUid !== targetUid) {
-        throw new functions.https.HttpsError('permission-denied', 'Only SuperAdmins can refresh another user\'s claims.');
-    }
-
     const db = admin.firestore();
     const [callerStaff, callerUser] = await Promise.all([
         db.collection('staff_accounts').doc(callerUid).get(),
@@ -3993,8 +4295,17 @@ exports.refreshAdminClaims = secureOnCall(async (request) => {
         throw new functions.https.HttpsError('permission-denied', 'Only active staff can refresh admin claims.');
     }
 
+    const isSuperAdmin = (request.auth.token && (request.auth.token.isSuperAdmin === true || request.auth.token.roleId === 'role-super-admin' || request.auth.token.roleId === 'super-admin')) ||
+        callerDoc.isSuperAdmin === true ||
+        callerDoc.roleId === 'role-super-admin' ||
+        callerDoc.roleId === 'super-admin';
+    if (!isSuperAdmin && callerUid !== targetUid) {
+        throw new functions.https.HttpsError('permission-denied', 'Only SuperAdmins can refresh another user\'s claims.');
+    }
+
     try {
         const res = await computeAndApplyUserClaims(targetUid);
+        await db.collection('staff_accounts').doc(targetUid).set({ claimsUpdatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
         return { success: true, ...res };
     } catch (error) {
         if (error instanceof functions.https.HttpsError) throw error;
@@ -4120,24 +4431,37 @@ exports.onSettingsSitesWritten = onDocumentWritten("settings/sites", async (even
     const afterSites = event.data.after.data()?.sites || event.data.after.data()?.sitesList || [];
     const beforeSites = event.data?.before?.exists ? (event.data.before.data()?.sites || event.data.before.data()?.sitesList || []) : [];
 
-    const extractSupervisors = (sites) => {
-        const sups = new Set();
+    const extractSupSiteMap = (sites) => {
+        const m = new Map();
         for (const s of sites) {
-            if (s && s.supervisorId) sups.add(s.supervisorId);
-            if (s && Array.isArray(s.supervisorIds)) s.supervisorIds.forEach(id => sups.add(id));
+            const siteId = s?.id || s?.siteId || '';
+            const sups = new Set([s?.supervisorId, ...(Array.isArray(s?.supervisorIds) ? s.supervisorIds : [])].filter(Boolean));
+            for (const id of sups) {
+                if (!m.has(id)) m.set(id, new Set());
+                if (siteId) m.get(id).add(siteId);
+            }
         }
-        return sups;
+        return m;
     };
 
-    const beforeSups = extractSupervisors(beforeSites);
-    const afterSups = extractSupervisors(afterSites);
+    const beforeMap = extractSupSiteMap(beforeSites);
+    const afterMap = extractSupSiteMap(afterSites);
 
     const changedSups = new Set();
-    for (const id of afterSups) {
-        if (!beforeSups.has(id)) changedSups.add(id);
-    }
-    for (const id of beforeSups) {
-        if (!afterSups.has(id)) changedSups.add(id);
+    const allSupIds = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+    for (const supId of allSupIds) {
+        const beforeSet = beforeMap.get(supId) || new Set();
+        const afterSet = afterMap.get(supId) || new Set();
+        if (beforeSet.size !== afterSet.size) {
+            changedSups.add(supId);
+        } else {
+            for (const sId of beforeSet) {
+                if (!afterSet.has(sId)) {
+                    changedSups.add(supId);
+                    break;
+                }
+            }
+        }
     }
 
     if (changedSups.size === 0) return;
@@ -4148,14 +4472,22 @@ exports.onSettingsSitesWritten = onDocumentWritten("settings/sites", async (even
     for (const supId of changedSups) {
         try {
             let authUser = await admin.auth().getUser(supId).catch(() => null);
+            let targetDocId = null;
+            let targetDocData = null;
             if (!authUser) {
                 const snap = await db.collection('staff_accounts').doc(supId).get();
                 if (snap.exists && snap.data().email) {
+                    targetDocId = snap.id;
+                    targetDocData = snap.data();
                     authUser = await admin.auth().getUserByEmail(snap.data().email).catch(() => null);
                 }
+            } else {
+                targetDocId = supId;
+                const snap = await db.collection('staff_accounts').doc(supId).get();
+                if (snap.exists) targetDocData = snap.data();
             }
             if (authUser) {
-                await computeAndApplyUserClaims(authUser.uid);
+                await computeAndApplyUserClaims(authUser.uid, targetDocId, targetDocData);
                 console.log(`[TRIGGER: onSettingsSitesWritten] Recomputed claims for supervisor ${authUser.uid}`);
             }
         } catch (supErr) {
@@ -4260,10 +4592,18 @@ exports.verifyCorrectionIdentity = secureOnCall(async (request) => {
         throw new functions.https.HttpsError('permission-denied', 'This correction link is locked due to too many failed attempts.');
     }
 
+    // Check expiry (UDF-AUD-87)
+    if (data.expiresAt) {
+        const expiryDate = data.expiresAt.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
+        if (expiryDate < new Date()) {
+            throw new functions.https.HttpsError('deadline-exceeded', 'This correction link has expired.');
+        }
+    }
+
     // Check if Google-linked and caller authenticated via Google
     let isGoogleVerified = false;
     if (data.authProvider === 'google' || data.linkedGoogleEmail) {
-        if (request.auth && request.auth.token && request.auth.token.email) {
+        if (request.auth && request.auth.token && request.auth.token.email && request.auth.token.email_verified === true) {
             const callerEmail = request.auth.token.email.toLowerCase().trim();
             const targetEmail = (data.linkedGoogleEmail || '').toLowerCase().trim();
             if (callerEmail === targetEmail) {
@@ -4300,17 +4640,20 @@ exports.verifyCorrectionIdentity = secureOnCall(async (request) => {
         const phoneMatch = Boolean(inputPhone10 && storedPhone10 && inputPhone10 === storedPhone10);
 
         if (!dobMatch || !phoneMatch) {
-            const newAttempts = (data.failedAttempts || 0) + 1;
-            const isNowLocked = newAttempts >= 5;
-            await docRef.update({
-                failedAttempts: newAttempts,
-                ...(isNowLocked ? { status: 'locked' } : {})
+            const newAttempts = await db.runTransaction(async (tx) => {
+                const s = await tx.get(docRef);
+                const n = (s.data()?.failedAttempts || 0) + 1;
+                tx.update(docRef, {
+                    failedAttempts: n,
+                    ...(n >= 5 ? { status: 'locked' } : {})
+                });
+                return n;
             });
 
-            if (isNowLocked) {
+            if (newAttempts >= 5) {
                 throw new functions.https.HttpsError('permission-denied', 'Verification failed. Link is now locked due to 5 failed attempts.');
             }
-            throw new functions.https.HttpsError('unauthenticated', `Verification details do not match. Attempts remaining: ${5 - newAttempts}`);
+            throw new functions.https.HttpsError('unauthenticated', `Verification details do not match. Attempts remaining: ${Math.max(0, 5 - newAttempts)}`);
         }
     }
 
@@ -4372,6 +4715,19 @@ exports.submitCorrectionServer = secureOnCall(async (request) => {
 
     if (reqData.status !== 'pending') {
         throw new functions.https.HttpsError('failed-precondition', 'Correction request is no longer pending.');
+    }
+
+    // Check expiry (UDF-AUD-87)
+    if (reqData.expiresAt) {
+        const expiryDate = reqData.expiresAt.toDate ? reqData.expiresAt.toDate() : new Date(reqData.expiresAt);
+        if (expiryDate < new Date()) {
+            throw new functions.https.HttpsError('deadline-exceeded', 'Correction link has expired.');
+        }
+    }
+
+    // Verify session token is current if activeSessionToken is recorded (UDF-AUD-87)
+    if (sessionToken && reqData.activeSessionToken && sessionToken !== reqData.activeSessionToken) {
+        throw new functions.https.HttpsError('permission-denied', 'Correction session has been superseded by a newer session.');
     }
 
     // Resolve target record first
@@ -4447,8 +4803,15 @@ exports.submitCorrectionServer = secureOnCall(async (request) => {
         for (const [key, value] of Object.entries(processedData)) {
             updates[`profileData.${key}`] = value;
             updates[`data.${key}`] = value;
+            if (targetData.formData) {
+                updates[`formData.${key}`] = value;
+            }
         }
     } else {
+        // Reset status back to 'Pending' so submission reappears in HR Review queue (UDF-AUD-87)
+        if (targetData.status === 'Correction Requested' || targetData.status === 'Correction Submitted' || targetData.status === 'Rejected') {
+            updates.status = 'Pending';
+        }
         for (const [key, value] of Object.entries(processedData)) {
             updates[`formData.${key}`] = value;
             if (targetData.data) {
@@ -4507,9 +4870,15 @@ exports.submitCorrectionServer = secureOnCall(async (request) => {
     const auditRef = db.collection('audit_logs').doc();
     batch.set(auditRef, {
         action: 'UPDATE',
+        actionType: 'UPDATE',
         category: 'EMPLOYEES',
+        targetModule: 'EMPLOYEES',
+        details: `Data correction completed for ${reqData.targetType} ${reqData.targetId} via token ${cleanToken}`,
         description: `Data correction completed for ${reqData.targetType} ${reqData.targetId} via token ${cleanToken}`,
         targetId: reqData.targetId,
+        actorId: 'DATA_CORRECTION_SESSION',
+        actorName: 'Candidate / Correction Session',
+        actorRole: 'Candidate',
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         performedBy: 'DATA_CORRECTION_SESSION',
         metadata: {
@@ -4645,7 +5014,9 @@ exports.onSubmissionCreated = onDocumentCreated("onboarding_submissions/{submiss
         // 5. Append-only server audit log
         await db.collection('audit_logs').add({
             action: 'SUBMIT',
+            actionType: 'CREATE',
             module: 'ONBOARDING',
+            targetModule: 'ONBOARDING',
             targetId: submissionId,
             actorId: data.ownerUid || data.linkedUid || 'candidate',
             actorName: data.applicantName || 'Candidate',
@@ -4743,7 +5114,7 @@ exports.processRequestReviewServer = secureOnCall(async (request) => {
     if (token.isDisabled === true) {
         throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
     }
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'super-admin';
+    let isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'super-admin' || token.roleId === 'role-super-admin';
 
     // 1. Resolve caller details, permissions, and sites
     let callerName = token.name || '';
@@ -4781,6 +5152,34 @@ exports.processRequestReviewServer = secureOnCall(async (request) => {
             }
         }
     }
+
+    // Apply per-user permission overrides from staff_accounts
+    try {
+        const saSnapCheck = await db.collection('staff_accounts').doc(uid).get();
+        if (saSnapCheck.exists) {
+            const saData = saSnapCheck.data();
+            if (saData.permissionOverrides && typeof saData.permissionOverrides === 'object') {
+                for (const [pKey, pVal] of Object.entries(saData.permissionOverrides)) {
+                    if (pVal === true && !permissions.includes(pKey)) {
+                        permissions.push(pKey);
+                    } else if (pVal === false) {
+                        permissions = permissions.filter(p => p !== pKey);
+                    }
+                }
+            }
+        }
+    } catch (overrideErr) {
+        console.warn(`[processRequestReviewServer] Could not load staff overrides for ${uid}:`, overrideErr.message);
+    }
+
+    if (callerRoleId === 'super-admin' || callerRoleId === 'role-super-admin') {
+        isSuperAdmin = true;
+    }
+    // SEC: Only SuperAdmin can execute an approval bypass (UDF-AUD-29)
+    if (Boolean(isBypass) && !isSuperAdmin) {
+        throw new functions.https.HttpsError('permission-denied', 'Only SuperAdmin can execute an approval bypass.');
+    }
+    const effectiveBypass = Boolean(isBypass) && isSuperAdmin;
 
     // 2. Permission check
     const moduleMap = {
@@ -4851,6 +5250,19 @@ exports.processRequestReviewServer = secureOnCall(async (request) => {
     const maxLevels = levels.length > 0 ? Math.max(...levels.map(l => l.level)) : 1;
     const currentLevel = Number(reqData.currentLevel) || 1;
 
+    // SEC: Verify caller is authorized for the current workflow level if roles are configured
+    if (!isSuperAdmin && levels.length > 0) {
+        const currentLevelConfig = levels.find(l => l.level === currentLevel);
+        if (currentLevelConfig && currentLevelConfig.roleId) {
+            if (callerRoleId !== currentLevelConfig.roleId) {
+                throw new functions.https.HttpsError(
+                    'permission-denied',
+                    `Your role (${callerRoleName || callerRoleId}) is not authorized to act on Level ${currentLevel} of this request.`
+                );
+            }
+        }
+    }
+
     let newStatus = reqData.status;
     let newLevel = currentLevel;
     let nextLevelRoleId = null;
@@ -4895,9 +5307,58 @@ exports.processRequestReviewServer = secureOnCall(async (request) => {
                     }
                 });
             }
+        } else if (collectionName === 'resignations' && (reqData.status === 'Approved' || reqData.resignationStatus === 'Relieved' || reqData.resignationStatus === 'Notice Period')) {
+            sideEffects.push(async (batch) => {
+                const empSnap = await resolveEmployeeDocAdmin(db, reqData.employeeId);
+                if (empSnap && empSnap.exists) {
+                    const empData = empSnap.data();
+                    batch.update(empSnap.ref, {
+                        isActive: true,
+                        status: 'Active',
+                        isRelieved: false,
+                        resignationStatus: 'Active',
+                        relievingDate: admin.firestore.FieldValue.delete(),
+                        pendingRelievingDate: admin.firestore.FieldValue.delete(),
+                        relievingReason: admin.firestore.FieldValue.delete(),
+                        relievingRemarks: admin.firestore.FieldValue.delete()
+                    });
+                    const linkedUid = empData.linkedUid || empData.uid || empData.portalId || empData.ownerUid;
+                    if (linkedUid && linkedUid.length > 5) {
+                        try {
+                            await admin.auth().updateUser(linkedUid, { disabled: false });
+                        } catch (authErr) {
+                            console.warn(`[processRequestReviewServer] Could not re-enable auth for ${linkedUid}:`, authErr.message);
+                        }
+                    }
+                }
+                const subSnap = await resolveSubmissionDocAdmin(db, reqData.employeeId, reqData.submissionId);
+                if (subSnap && subSnap.exists) {
+                    batch.update(subSnap.ref, {
+                        isActive: true,
+                        status: 'Approved',
+                        isRelieved: false,
+                        resignationStatus: 'Active',
+                        relievingDate: admin.firestore.FieldValue.delete()
+                    });
+                }
+            });
+        } else if (collectionName === 'account_updates' && reqData.status === 'Approved' && reqData.previousValue !== undefined && reqData.fieldId) {
+            const fieldId = reqData.fieldId;
+            const prevVal = reqData.previousValue;
+            sideEffects.push(async (batch) => {
+                const empSnap = await resolveEmployeeDocAdmin(db, reqData.employeeId);
+                if (empSnap && empSnap.exists) {
+                    batch.update(empSnap.ref, {
+                        [`profileData.${fieldId}`]: prevVal,
+                        [`data.${fieldId}`]: prevVal,
+                        lastUpdated: new Date().toISOString()
+                    });
+                }
+            });
         }
     } else if (normalizedAction === 'APPROVE') {
-        if (!isBypass && currentLevel < maxLevels) {
+        const isTargetFinal = Boolean(targetLevel && Number(targetLevel) >= maxLevels);
+        if (!effectiveBypass && !isTargetFinal && currentLevel < maxLevels) {
             // Advance to next workflow level that has an assigned role
             let nextLvl = currentLevel + 1;
             let foundNext = levels.find(l => l.level === nextLvl && l.roleId);
@@ -4936,9 +5397,37 @@ exports.processRequestReviewServer = secureOnCall(async (request) => {
                     sideEffects.push(async (batch) => {
                         const empSnap = await resolveEmployeeDocAdmin(db, reqData.employeeId);
                         if (empSnap && empSnap.exists) {
-                            batch.update(empSnap.ref, {
-                                [`leaveBalance.${balanceKey}`]: admin.firestore.FieldValue.increment(-daysTaken)
-                            });
+                            const empData = empSnap.data();
+                            const currentBal = empData.leaveBalance && empData.leaveBalance[balanceKey] !== undefined
+                                ? Number(empData.leaveBalance[balanceKey])
+                                : null;
+                            if (currentBal !== null && !isNaN(currentBal)) {
+                                batch.update(empSnap.ref, {
+                                    [`leaveBalance.${balanceKey}`]: admin.firestore.FieldValue.increment(-daysTaken)
+                                });
+                            } else {
+                                // Balance not explicitly initialized yet on employee record.
+                                // Fetch policy default quota or fall back to 12 (UDF-AUD-44)
+                                let defaultQuota = 12;
+                                try {
+                                    const polSnap = await db.collection('settings').doc('leave_policy').get();
+                                    if (polSnap.exists && Array.isArray(polSnap.data().leaveTypes)) {
+                                        const matchedType = polSnap.data().leaveTypes.find(lt => 
+                                            (lt.typeId && lt.typeId.toLowerCase() === balanceKey.toLowerCase()) ||
+                                            (lt.label && (lt.label.toLowerCase().includes(balanceKey) || balanceKey.includes(lt.label.toLowerCase())))
+                                        );
+                                        if (matchedType && typeof matchedType.defaultQuota === 'number') {
+                                            defaultQuota = matchedType.defaultQuota;
+                                        }
+                                    }
+                                } catch (e) {
+                                    console.warn('[processRequestReviewServer] Could not fetch leave policy:', e.message);
+                                }
+                                const newRemaining = Math.max(0, defaultQuota - daysTaken);
+                                batch.update(empSnap.ref, {
+                                    [`leaveBalance.${balanceKey}`]: newRemaining
+                                });
+                            }
                         }
                     });
                 }
@@ -5004,10 +5493,23 @@ exports.processRequestReviewServer = secureOnCall(async (request) => {
                                 isActive: false,
                                 status: 'Relieved',
                                 isRelieved: true,
+                                assignedSiteIds: [],
+                                activeAssignments: [],
                                 relievingDate: effectiveRelDate,
                                 relievingReason: reqData.reason || 'Resignation'
                             });
                             isProcessed = true;
+
+                            // Disable Firebase Auth account
+                            const empData = empSnap.data();
+                            const linkedUid = empData.linkedUid || empData.uid || empData.portalId || empData.ownerUid;
+                            if (linkedUid && linkedUid !== 'none' && linkedUid.length > 5) {
+                                try {
+                                    await admin.auth().updateUser(linkedUid, { disabled: true });
+                                } catch (authErr) {
+                                    console.warn(`[processRequestReviewServer] Could not disable auth for ${linkedUid}:`, authErr.message);
+                                }
+                            }
                         } else {
                             batch.update(empSnap.ref, {
                                 resignationStatus: 'Notice Period',
@@ -5025,6 +5527,8 @@ exports.processRequestReviewServer = secureOnCall(async (request) => {
                                     isActive: false,
                                     status: 'Relieved',
                                     isRelieved: true,
+                                    assignedSiteIds: [],
+                                    activeAssignments: [],
                                     relievingDate: effectiveRelDate,
                                     relievingReason: reqData.reason || 'Resignation'
                                 });
@@ -5066,7 +5570,9 @@ exports.processRequestReviewServer = secureOnCall(async (request) => {
     const auditRef = db.collection('audit_logs').doc();
     batch.set(auditRef, {
         action: normalizedAction === 'APPROVE' ? 'APPROVAL' : (normalizedAction === 'REJECT' ? 'REJECTION' : 'STATUS_CHANGE'),
+        actionType: normalizedAction === 'APPROVE' ? 'APPROVAL' : (normalizedAction === 'REJECT' ? 'REJECTION' : 'STATUS_CHANGE'),
         module: modId,
+        targetModule: modId,
         targetId: requestId,
         actorId: uid,
         actorName: callerName,
@@ -5168,7 +5674,7 @@ exports.approveOnboardingServer = secureOnCall(async (request) => {
     if (token.isDisabled === true) {
         throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
     }
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'super-admin' || token.roleId === 'role-super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
     // Verify permission: SUBMISSIONS_APPROVE or SuperAdmin
@@ -5178,7 +5684,7 @@ exports.approveOnboardingServer = secureOnCall(async (request) => {
             throw new functions.https.HttpsError('permission-denied', 'Account is disabled or inactive.');
         }
         const roleId = saSnap.exists ? saSnap.data().roleId : null;
-        let allowed = roleId === 'role-super-admin';
+        let allowed = roleId === 'role-super-admin' || roleId === 'super-admin';
         if (!allowed && roleId) {
             const roleSnap = await db.collection('roles').doc(roleId).get();
             if (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) {
@@ -5320,6 +5826,8 @@ exports.approveOnboardingServer = secureOnCall(async (request) => {
     const empDocRef = db.collection('employees').doc(submissionId);
     const newEmployee = {
         uid: subData.linkedUid || subData.uid || submissionId,
+        linkedUid: subData.linkedUid || null,
+        googleUid: subData.linkedUid || subData.googleUid || null,
         employeeId: cleanEmpId,
         portalId: submissionId,
         profileData: migratedProfileData,
@@ -5341,7 +5849,7 @@ exports.approveOnboardingServer = secureOnCall(async (request) => {
         isRelieved: false,
         applicantName: employeeName,
         driveFolderName: newFolderName,
-        authProvider: subData.authProvider || 'manual',
+        authProvider: subData.authProvider || (subData.linkedGoogleEmail ? 'google' : 'manual'),
         linkedGoogleEmail: subData.linkedGoogleEmail || '',
         needsProfileCompletion: profileCompletionData?.profileCompletionStatus === 'INCOMPLETE',
         profileStatus: profileCompletionData?.profileCompletionStatus === 'INCOMPLETE' ? 'waiting_for_employee' : 'approved',
@@ -5438,17 +5946,22 @@ exports.approveOnboardingServer = secureOnCall(async (request) => {
         }
     }
 
-    // Increment invite joined count if referral
-    if (subData.inviteId) {
+    // Increment invite joined count if referral and invite exists and not already recorded at submission (UDF-AUD-209)
+    if (subData.inviteId && !subData.referralJoinedRecorded) {
         const inviteRef = db.collection('referral_invites').doc(subData.inviteId);
-        batch.update(inviteRef, { joined: admin.firestore.FieldValue.increment(1) });
+        const inviteSnap = await inviteRef.get();
+        if (inviteSnap.exists) {
+            batch.update(inviteRef, { joined: admin.firestore.FieldValue.increment(1) });
+        }
     }
 
     // Append to audit_logs
     const auditRef = db.collection('audit_logs').doc();
     batch.set(auditRef, {
         action: 'APPROVAL',
+        actionType: 'APPROVAL',
         module: 'ONBOARDING',
+        targetModule: 'ONBOARDING',
         targetId: submissionId,
         actorId: uid,
         actorName: token.name || 'Admin',
@@ -5503,21 +6016,26 @@ exports.relieveEmployeeServer = secureOnCall(async (request) => {
     if (token.isDisabled === true) {
         throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
     }
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'super-admin' || token.roleId === 'role-super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
-    // Verify permission: RESIGNATIONS_APPROVE, DELETE_EMPLOYEE, or SuperAdmin
-    if (!isSuperAdmin && !permissions.includes('RESIGNATIONS_APPROVE') && !permissions.includes('DELETE_EMPLOYEE')) {
+    // Verify permission: EMPLOYEES_ACTION_RELIEVE, RESIGNATIONS_APPROVE, DELETE_EMPLOYEE, or SuperAdmin
+    const hasRelievePerm = permissions.includes('EMPLOYEES_ACTION_RELIEVE') ||
+        permissions.includes('RESIGNATIONS_APPROVE') ||
+        permissions.includes('DELETE_EMPLOYEE');
+    if (!isSuperAdmin && !hasRelievePerm) {
         const saSnap = await db.collection('staff_accounts').doc(uid).get();
         if (saSnap.exists && (saSnap.data().isDisabled === true || saSnap.data().isActive === false)) {
             throw new functions.https.HttpsError('permission-denied', 'Account is disabled or inactive.');
         }
         const roleId = saSnap.exists ? saSnap.data().roleId : null;
-        let allowed = roleId === 'role-super-admin';
+        let allowed = roleId === 'role-super-admin' || roleId === 'super-admin';
         if (!allowed && roleId) {
             const roleSnap = await db.collection('roles').doc(roleId).get();
             if (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) {
-                allowed = roleSnap.data().permissions.includes('RESIGNATIONS_APPROVE') || roleSnap.data().permissions.includes('DELETE_EMPLOYEE');
+                allowed = roleSnap.data().permissions.includes('EMPLOYEES_ACTION_RELIEVE') ||
+                    roleSnap.data().permissions.includes('RESIGNATIONS_APPROVE') ||
+                    roleSnap.data().permissions.includes('DELETE_EMPLOYEE');
             }
         }
         if (!allowed) {
@@ -5556,11 +6074,14 @@ exports.relieveEmployeeServer = secureOnCall(async (request) => {
 
     const batch = db.batch();
 
-    // 1. Mark employee record relieved
+    // 1. Mark employee record relieved and clear active site assignments
     batch.update(empSnap.ref, {
         isActive: false,
         status: 'Relieved',
         isRelieved: true,
+        currentSiteId: null,
+        assignedSiteIds: [],
+        activeAssignments: [],
         relievingDate,
         relievingReason: cleanReason,
         relievingRemarks: cleanRemarks,
@@ -5574,6 +6095,9 @@ exports.relieveEmployeeServer = secureOnCall(async (request) => {
             isActive: false,
             status: 'Relieved',
             isRelieved: true,
+            currentSiteId: null,
+            assignedSiteIds: [],
+            activeAssignments: [],
             relievingDate,
             relievingReason: cleanReason,
             relievingRemarks: cleanRemarks
@@ -5595,7 +6119,9 @@ exports.relieveEmployeeServer = secureOnCall(async (request) => {
     const auditRef = db.collection('audit_logs').doc();
     batch.set(auditRef, {
         action: 'STATUS_CHANGE',
+        actionType: 'STATUS_CHANGE',
         module: 'EMPLOYEES',
+        targetModule: 'EMPLOYEES',
         targetId: empData.employeeId || empSnap.id,
         actorId: uid,
         actorName: token.name || 'Admin',
@@ -5655,11 +6181,37 @@ exports.rejoinEmployeeServer = secureOnCall(async (request) => {
     if (token.isDisabled === true) {
         throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
     }
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'super-admin' || token.roleId === 'role-super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
-    // Verify permission: SUBMISSIONS_APPROVE or SuperAdmin
-    if (!isSuperAdmin && !permissions.includes('SUBMISSIONS_APPROVE')) {
+    // Verify permission: EMPLOYEES_ACTION_REJOIN, SUBMISSIONS_APPROVE or SuperAdmin (UDF-AUD-57)
+    let hasRejoinPerm = isSuperAdmin || 
+        permissions.includes('EMPLOYEES_ACTION_REJOIN') || 
+        permissions.includes('SUBMISSIONS_APPROVE');
+
+    if (!hasRejoinPerm) {
+        // Fallback to staff account / role check in Firestore
+        const saSnap = await db.collection('staff_accounts').doc(uid).get();
+        if (saSnap.exists) {
+            const saData = saSnap.data();
+            if (saData.roleId === 'role-super-admin' || saData.roleId === 'super-admin') {
+                hasRejoinPerm = true;
+            } else if (saData.roleId) {
+                const roleSnap = await db.collection('roles').doc(saData.roleId).get();
+                if (roleSnap.exists) {
+                    const rData = roleSnap.data();
+                    const rPerms = Array.isArray(rData.permissions) ? rData.permissions : [];
+                    hasRejoinPerm = rPerms.includes('EMPLOYEES_ACTION_REJOIN') || rPerms.includes('SUBMISSIONS_APPROVE');
+                }
+            }
+            if (saData.permissionOverrides && typeof saData.permissionOverrides === 'object') {
+                if (saData.permissionOverrides['EMPLOYEES_ACTION_REJOIN'] === true) hasRejoinPerm = true;
+                if (saData.permissionOverrides['EMPLOYEES_ACTION_REJOIN'] === false) hasRejoinPerm = false;
+            }
+        }
+    }
+
+    if (!hasRejoinPerm) {
         throw new functions.https.HttpsError('permission-denied', 'Missing permission to rejoin employees.');
     }
 
@@ -5791,7 +6343,39 @@ exports.rejoinEmployeeServer = secureOnCall(async (request) => {
             timestamp: new Date().toISOString()
         });
 
+        // 5. Sync to submission doc if exists
+        const subSnap = await resolveSubmissionDocAdmin(db, origData.employeeId, origEmpSnap.id);
+        if (subSnap && subSnap.exists) {
+            batch.update(subSnap.ref, {
+                employeeId: cleanNewId,
+                isActive: true,
+                status: 'Approved',
+                isRelieved: false,
+                relievingDate: admin.firestore.FieldValue.delete(),
+                relievingReason: admin.firestore.FieldValue.delete(),
+                relievingRemarks: admin.firestore.FieldValue.delete(),
+                lastUpdated: new Date().toISOString()
+            });
+        }
+
         await batch.commit();
+
+        // 6. Re-enable Firebase Auth user if disabled and update claims with new Employee ID
+        const linkedUid = origData.linkedUid || origData.uid;
+        if (linkedUid && linkedUid !== 'none' && linkedUid.length > 5) {
+            try {
+                await admin.auth().updateUser(linkedUid, { disabled: false });
+                const currentCustomClaims = (await admin.auth().getUser(linkedUid)).customClaims || {};
+                await admin.auth().setCustomUserClaims(linkedUid, {
+                    ...currentCustomClaims,
+                    employeeId: cleanNewId,
+                    portalId: cleanNewId
+                });
+                console.log(`[rejoinEmployeeServer] Re-enabled Firebase Auth user ${linkedUid} and updated claims to ${cleanNewId}`);
+            } catch (authErr) {
+                console.warn(`[rejoinEmployeeServer] Could not re-enable Auth user ${linkedUid}:`, authErr.message);
+            }
+        }
 
         console.log(`[rejoinEmployeeServer] Successfully rejoined ${employeeId} as ${cleanNewId}`);
         return {
@@ -5971,18 +6555,57 @@ exports.completeTrainingQuizServer = secureOnCall(async (request) => {
     }
 
     const db = admin.firestore();
-    // SEC-10: Pinned strictly to server date to prevent past/future point farming
-    const today = new Date().toISOString().split('T')[0];
+    // IST Timezone enforcement (UDF-AUD-178): Pinned strictly to Asia/Kolkata date
+    const nowIst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+    const today = `${nowIst.getFullYear()}-${String(nowIst.getMonth() + 1).padStart(2, "0")}-${String(nowIst.getDate()).padStart(2, "0")}`;
 
-    // 1. Rate-limit / Duplicate check: Has this user already completed today's quiz?
-    const existingLogSnap = await db.collection('gamification_logs')
-        .where('userId', '==', uid)
+    // Determine target user document upfront
+    let targetDocId = uid;
+    const requestedId = (request.data && typeof request.data.targetUserId === 'string') ? request.data.targetUserId.trim() : '';
+    if (requestedId && requestedId !== uid && !requestedId.includes('/')) {
+        if (request.auth.token && (request.auth.token.employeeId === requestedId || request.auth.token.portalId === requestedId)) {
+            targetDocId = requestedId;
+        } else {
+            const empCheck = await db.collection('employees').doc(requestedId).get();
+            if (empCheck.exists && (empCheck.data().uid === uid || empCheck.data().linkedUid === uid)) {
+                targetDocId = requestedId;
+            }
+        }
+    }
+
+    // 1. Rate-limit / Duplicate check: Has this user already completed today's quiz? (UDF-AUD-47)
+    let existingLogSnap = await db.collection('gamification_logs')
+        .where('userId', '==', targetDocId)
         .where('type', '==', 'QUIZ')
         .where('date', '==', today)
         .limit(1)
         .get();
 
+    if (existingLogSnap.empty && targetDocId !== uid) {
+        existingLogSnap = await db.collection('gamification_logs')
+            .where('userId', '==', uid)
+            .where('type', '==', 'QUIZ')
+            .where('date', '==', today)
+            .limit(1)
+            .get();
+    }
+
+    if (existingLogSnap.empty) {
+        existingLogSnap = await db.collection('gamification_logs')
+            .where('userUid', '==', uid)
+            .where('type', '==', 'QUIZ')
+            .where('date', '==', today)
+            .limit(1)
+            .get();
+    }
+
     if (!existingLogSnap.empty) {
+        throw new functions.https.HttpsError('already-exists', 'You have already completed the daily quiz today.');
+    }
+
+    // Also verify against user_engagement document directly
+    const engagementDocCheck = await db.collection('user_engagement').doc(targetDocId).get();
+    if (engagementDocCheck.exists && engagementDocCheck.data().lastQuizDate === today) {
         throw new functions.https.HttpsError('already-exists', 'You have already completed the daily quiz today.');
     }
 
@@ -6019,18 +6642,6 @@ exports.completeTrainingQuizServer = secureOnCall(async (request) => {
     }
 
     // 4. Atomically update user_engagement points and write to gamification_logs
-    let targetDocId = uid;
-    const requestedId = (request.data && typeof request.data.targetUserId === 'string') ? request.data.targetUserId.trim() : '';
-    if (requestedId && requestedId !== uid && !requestedId.includes('/')) {
-        if (request.auth.token && request.auth.token.employeeId === requestedId) {
-            targetDocId = requestedId;
-        } else {
-            const empCheck = await db.collection('employees').doc(requestedId).get();
-            if (empCheck.exists && (empCheck.data().uid === uid || empCheck.data().linkedUid === uid)) {
-                targetDocId = requestedId;
-            }
-        }
-    }
     const engagementRef = db.collection('user_engagement').doc(targetDocId);
     const logRef = db.collection('gamification_logs').doc();
 
@@ -6042,12 +6653,9 @@ exports.completeTrainingQuizServer = secureOnCall(async (request) => {
         lastUpdated: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
 
+    // Clean up duplicate uid document if targetDocId !== uid to prevent duplicate leaderboard entries (UDF-AUD-177)
     if (targetDocId !== uid) {
-        batch.set(db.collection('user_engagement').doc(uid), {
-            points: admin.firestore.FieldValue.increment(quizPoints),
-            lastQuizDate: today,
-            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
+        batch.delete(db.collection('user_engagement').doc(uid));
     }
 
     batch.set(logRef, {
@@ -6063,7 +6671,7 @@ exports.completeTrainingQuizServer = secureOnCall(async (request) => {
 
     await batch.commit();
 
-    console.log(`[completeTrainingQuizServer] Awarded ${quizPoints} pts to ${uid} for quiz on ${today}`);
+    console.log(`[completeTrainingQuizServer] Awarded ${quizPoints} pts to ${targetDocId} for quiz on ${today}`);
     return {
         success: true,
         isCorrect: true,
@@ -6246,12 +6854,13 @@ async function syncRecordToDriveAndSheetsCore(recordId, explicitType) {
         driveBackupStartedAt: new Date().toISOString()
     });
 
-    const applicantName = recordData.applicantName || recordData.name || (recordData.profileData && recordData.profileData.personalDetails && recordData.profileData.personalDetails.fullName) || 'Candidate';
-    const folderId = recordData.employeeId || recordData.portalId || recordId;
-    const formData = recordData.formData || recordData.profileData || recordData.data || {};
-    const isPending = !isEmployee || folderId.startsWith('SUB-') || folderId.startsWith('UDF-') || !recordData.isActive;
+    try {
+        const applicantName = recordData.applicantName || recordData.name || (recordData.profileData && recordData.profileData.personalDetails && recordData.profileData.personalDetails.fullName) || 'Candidate';
+        const folderId = recordData.employeeId || recordData.portalId || recordId;
+        const formData = recordData.formData || recordData.profileData || recordData.data || {};
+        const isPending = !isEmployee || folderId.startsWith('SUB-') || folderId.startsWith('UDF-') || !recordData.isActive;
 
-    console.log(`[CLOUD-7 syncRecordToDriveAndSheetsCore] Starting sync for ${applicantName} (${folderId})...`);
+        console.log(`[CLOUD-7 syncRecordToDriveAndSheetsCore] Starting sync for ${applicantName} (${folderId})...`);
 
     // 1. Collect all Storage paths from form data
     const storagePaths = [];
@@ -6355,6 +6964,8 @@ async function syncRecordToDriveAndSheetsCore(recordId, explicitType) {
     };
     if (isEmployee) {
         updatePayload.data = updatedFormData;
+        updatePayload.profileData = updatedFormData;
+        updatePayload.formData = updatedFormData;
     } else {
         updatePayload.formData = updatedFormData;
     }
@@ -6365,13 +6976,18 @@ async function syncRecordToDriveAndSheetsCore(recordId, explicitType) {
     let sheetsSyncStatus = 'pending';
     try {
         sheetsSyncStatus = await appendSubmissionToSheetsServer(recordData, updatedFormData, folderUrl);
+        const isSheetsSuccess = sheetsSyncStatus === 'sheets_appended' || sheetsSyncStatus === 'form_synced' || sheetsSyncStatus === 'already_synced';
         await targetDocRef.update({
-            googleFormSyncStatus: 'synced',
+            googleFormSyncStatus: isSheetsSuccess ? 'synced' : 'failed',
             googleFormSyncedAt: new Date().toISOString(),
             googleSheetsSyncStatus: sheetsSyncStatus
         });
     } catch (sheetErr) {
         console.warn(`[CLOUD-7] Sheets sync warning for ${recordId}:`, sheetErr.message);
+        await targetDocRef.update({
+            googleFormSyncStatus: 'failed',
+            googleSheetsSyncStatus: 'error'
+        }).catch(() => {});
     }
 
     return {
@@ -6381,6 +6997,14 @@ async function syncRecordToDriveAndSheetsCore(recordId, explicitType) {
         driveUrls: uploadedDriveUrls,
         sheetsStatus: sheetsSyncStatus
     };
+    } catch (syncErr) {
+        console.error(`[CLOUD-7] Drive and Sheets sync failed for ${recordId}:`, syncErr);
+        await targetDocRef.update({
+            driveBackupStatus: 'failed',
+            driveBackupError: syncErr.message || 'Sync failed'
+        }).catch(() => {});
+        throw syncErr;
+    }
 }
 
 /**
@@ -6535,7 +7159,7 @@ async function appendSubmissionToSheetsServer(recordData, formData, driveFolderU
             await sheets.spreadsheets.values.append({
                 spreadsheetId,
                 range: 'Sheet1!A:Z',
-                valueInputOption: 'USER_ENTERED',
+                valueInputOption: 'RAW', // UDF-AUD-85: Use RAW to eliminate formula injection
                 requestBody: {
                     values: [row]
                 }
@@ -6597,7 +7221,7 @@ exports.syncEmployeeToGoogleDriveServer = secureOnCall({ timeoutSeconds: 300, me
     if (callerClaims.isDisabled === true) {
         throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
     }
-    let isSuperAdmin = callerClaims.isSuperAdmin === true || callerClaims.roleId === 'role-super-admin';
+    let isSuperAdmin = callerClaims.isSuperAdmin === true || callerClaims.roleId === 'role-super-admin' || callerClaims.roleId === 'super-admin';
     if (!isSuperAdmin) {
         const db = admin.firestore();
         const [uSnap, sSnap] = await Promise.all([
@@ -6608,7 +7232,7 @@ exports.syncEmployeeToGoogleDriveServer = secureOnCall({ timeoutSeconds: 300, me
         if (prof.isDisabled === true || prof.isActive === false) {
             throw new functions.https.HttpsError('permission-denied', 'Account is disabled or inactive.');
         }
-        if (prof.roleId === 'role-super-admin' || prof.type === 'Admin' || (Array.isArray(prof.roles) && prof.roles.includes('super-admin'))) {
+        if (prof.roleId === 'role-super-admin' || prof.roleId === 'super-admin' || prof.type === 'Admin' || (Array.isArray(prof.roles) && prof.roles.includes('super-admin'))) {
             isSuperAdmin = true;
         }
     }
@@ -6641,7 +7265,7 @@ exports.syncSubmissionToSheetsServer = secureOnCall({ timeoutSeconds: 120 }, asy
     if (callerClaims.isDisabled === true) {
         throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
     }
-    let isSuperAdmin = callerClaims.isSuperAdmin === true || callerClaims.roleId === 'role-super-admin';
+    let isSuperAdmin = callerClaims.isSuperAdmin === true || callerClaims.roleId === 'role-super-admin' || callerClaims.roleId === 'super-admin';
     if (!isSuperAdmin) {
         const db = admin.firestore();
         const [uSnap, sSnap] = await Promise.all([
@@ -6652,7 +7276,7 @@ exports.syncSubmissionToSheetsServer = secureOnCall({ timeoutSeconds: 120 }, asy
         if (prof.isDisabled === true || prof.isActive === false) {
             throw new functions.https.HttpsError('permission-denied', 'Account is disabled or inactive.');
         }
-        if (prof.roleId === 'role-super-admin' || prof.type === 'Admin' || (Array.isArray(prof.roles) && prof.roles.includes('super-admin'))) {
+        if (prof.roleId === 'role-super-admin' || prof.roleId === 'super-admin' || prof.type === 'Admin' || (Array.isArray(prof.roles) && prof.roles.includes('super-admin'))) {
             isSuperAdmin = true;
         }
     }
@@ -6799,7 +7423,7 @@ exports.permanentDeleteEmployeeServer = secureOnCall({ timeoutSeconds: 300, memo
 
     const db = admin.firestore();
     const uid = request.auth.uid;
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin' || token.roleId === 'super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
     // Authorization: SuperAdmin or DELETE_EMPLOYEE / SUBMISSIONS_APPROVE
@@ -6809,7 +7433,7 @@ exports.permanentDeleteEmployeeServer = secureOnCall({ timeoutSeconds: 300, memo
             throw new functions.https.HttpsError('permission-denied', 'Account is disabled or inactive.');
         }
         const roleId = saSnap.exists ? saSnap.data().roleId : null;
-        let allowed = roleId === 'role-super-admin';
+        let allowed = roleId === 'role-super-admin' || roleId === 'super-admin';
         if (!allowed && roleId) {
             const roleSnap = await db.collection('roles').doc(roleId).get();
             if (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) {
@@ -6958,11 +7582,14 @@ exports.permanentDeleteEmployeeServer = secureOnCall({ timeoutSeconds: 300, memo
     // 4. Server Audit Log
     await db.collection('audit_logs').add({
         action: 'PERMANENT_DELETE',
+        actionType: 'DELETE',
         category: 'EMPLOYEES',
+        targetModule: 'EMPLOYEES',
         targetId: employeeId,
         targetName: resolvedName,
         actorId: uid,
         actorEmail: token.email || 'Admin',
+        actorName: token.name || token.email || 'Admin',
         details: `Permanently deleted employee ${resolvedName} (${employeeId}) and ${totalDeleted} associated record(s).`,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     }).catch(() => {});
@@ -7047,13 +7674,14 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
     }
 
     const db = admin.firestore();
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin' || token.roleId === 'super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
-    // Authorization: SuperAdmin or EMPLOYEES_TAB_RECYCLE_BIN / DELETE_EMPLOYEE
+    // Authorization: SuperAdmin or EMPLOYEES_TAB_RECYCLE_BIN / DELETE_EMPLOYEE / EMPLOYEES_ACTION_RESTORE
     let hasRestorePerm = isSuperAdmin || 
         permissions.includes('EMPLOYEES_TAB_RECYCLE_BIN') || 
-        permissions.includes('DELETE_EMPLOYEE');
+        permissions.includes('DELETE_EMPLOYEE') ||
+        permissions.includes('EMPLOYEES_ACTION_RESTORE');
 
     if (!hasRestorePerm) {
         const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
@@ -7061,11 +7689,12 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
         if (!saData || saData.isDisabled === true || saData.isActive === false) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission to restore items from Recycle Bin.');
         }
-        let allowed = saData.roleId === 'role-super-admin';
+        let allowed = saData.roleId === 'role-super-admin' || saData.roleId === 'super-admin';
+        if (!allowed && saData.permissionOverrides?.EMPLOYEES_ACTION_RESTORE === true) allowed = true;
         if (!allowed && saData.roleId) {
             const roleSnap = await db.collection('roles').doc(saData.roleId).get();
-            const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
-            allowed = rolePerms.includes('EMPLOYEES_TAB_RECYCLE_BIN') || rolePerms.includes('DELETE_EMPLOYEE');
+            const rolePerms = (roleSnap.exists && roleSnap.data().isDisabled !== true && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
+            allowed = rolePerms.includes('EMPLOYEES_TAB_RECYCLE_BIN') || rolePerms.includes('DELETE_EMPLOYEE') || rolePerms.includes('EMPLOYEES_ACTION_RESTORE');
         }
         if (!allowed) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission to restore items from Recycle Bin.');
@@ -7084,6 +7713,38 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
     if (['STAFF', 'ROLE'].includes(String(itemType || '').toUpperCase()) && !isSuperAdmin) {
         throw new functions.https.HttpsError('permission-denied', 'Only SuperAdmin can restore Staff accounts or Roles.');
     }
+    if (String(itemType || '').toUpperCase() === 'SITE' && !isSuperAdmin && !permissions.includes('SITES_MANAGE') && !permissions.includes('MANAGE_SITES')) {
+        throw new functions.https.HttpsError('permission-denied', 'Only authorized staff can restore Sites.');
+    }
+    if (String(itemType || '').toUpperCase() === 'DESIGNATION' && !isSuperAdmin && !permissions.includes('MANAGE_SYSTEM')) {
+        throw new functions.https.HttpsError('permission-denied', 'Only authorized staff can restore Designations.');
+    }
+    if (String(itemType || '').toUpperCase() === 'VACANCY' && !isSuperAdmin && !permissions.includes('VACANCIES_MANAGE')) {
+        throw new functions.https.HttpsError('permission-denied', 'Only authorized staff can restore Vacancies.');
+    }
+    if (String(itemType || '').toUpperCase() === 'INVITE' && !isSuperAdmin && !permissions.includes('INVITES_REACTIVATE') && !permissions.includes('INVITES_MANAGE')) {
+        throw new functions.https.HttpsError('permission-denied', 'Only authorized staff can restore Referral Invites.');
+    }
+
+    // Site-scoping authorization for non-SuperAdmins on EMPLOYEE and SUBMISSION (UDF-AUD-235)
+    if (!isSuperAdmin && ['EMPLOYEE', 'SUBMISSION'].includes(String(itemType || '').toUpperCase())) {
+        const itemSiteId = data?.currentSiteId || data?.siteId || metadata?.siteId || '';
+        const hasGlobalScope = permissions.includes('EMPLOYEES_VIEW_SCOPE_ALL') ||
+            permissions.includes('SUBMISSIONS_VIEW_SCOPE_ALL') ||
+            permissions.includes('MANAGE_ALL_SITES');
+        
+        let callerSites = Array.isArray(token.sitesManaged) ? token.sitesManaged : [];
+        if (callerSites.length === 0) {
+            const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
+            if (saSnap.exists) {
+                callerSites = Array.isArray(saSnap.data()?.sitesManaged) ? saSnap.data().sitesManaged : [];
+            }
+        }
+
+        if (!hasGlobalScope && itemSiteId && !callerSites.includes(itemSiteId)) {
+            throw new functions.https.HttpsError('permission-denied', `You do not have management authority to restore records for site "${itemSiteId}".`);
+        }
+    }
 
     const nowIso = new Date().toISOString();
 
@@ -7101,13 +7762,13 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
             };
             await sitesRef.set({ sites: [...filtered, restoredSite] }, { merge: true });
 
-            // Restore linked vacancies if present
+            // Restore linked vacancies if present (preserve Closed status so closed positions do not reopen)
             if (metadata && Array.isArray(metadata.linkedVacancies)) {
                 for (const vac of metadata.linkedVacancies) {
                     if (vac && vac.id) {
                         await db.collection('vacancies').doc(vac.id).set({
                             ...vac,
-                            status: 'Open',
+                            status: (vac.status === 'Closed' ? 'Closed' : 'Open'),
                             isDeleted: false,
                             restoredAt: nowIso
                         }, { merge: true }).catch(() => {});
@@ -7141,26 +7802,36 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
         }
 
         case 'EMPLOYEE': {
+            const wasRelieved = !!(data?.isRelieved === true || data?.status === 'Relieved' || data?.relievingDate);
             const empRef = db.collection('employees').doc(originalId);
             await empRef.set({
                 ...(data || {}),
                 id: originalId,
-                isActive: true,
+                isActive: !wasRelieved,
+                status: wasRelieved ? 'Relieved' : (data?.status || 'Active'),
+                isRelieved: wasRelieved,
                 isDeleted: false,
                 deletedAt: null,
                 restoredAt: nowIso
             }, { merge: true });
 
             // Also re-activate onboarding_submissions if present
-            const subRef = db.collection('onboarding_submissions').doc(originalId);
+            const subDocId = data?.submissionId || data?.portalId || originalId;
+            const subRef = db.collection('onboarding_submissions').doc(subDocId);
             const subSnap = await subRef.get();
             if (subSnap.exists) {
                 await subRef.update({
-                    isActive: true,
+                    isActive: !wasRelieved,
+                    isRelieved: wasRelieved,
                     isDeleted: false,
                     deletedAt: null,
                     restoredAt: nowIso
                 }).catch(() => {});
+            }
+
+            const empAuthUid = data?.uid || data?.linkedUid || originalId;
+            if (!wasRelieved && empAuthUid && empAuthUid !== 'none' && empAuthUid.length > 5) {
+                await admin.auth().updateUser(empAuthUid, { disabled: false }).catch(() => {});
             }
             break;
         }
@@ -7233,11 +7904,14 @@ exports.restoreRecycleBinServer = secureOnCall({ timeoutSeconds: 60 }, async (re
     // Server Audit Log
     await db.collection('audit_logs').add({
         action: 'RESTORE',
+        actionType: 'STATUS_CHANGE',
         category: 'RECYCLE_BIN',
+        targetModule: 'RECYCLE_BIN',
         targetId: originalId,
         itemType,
         actorId: request.auth.uid,
         actorEmail: token.email || 'Admin',
+        actorName: token.name || token.email || 'Admin',
         details: `Restored ${itemType} "${originalId}" from Recycle Bin.`,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     }).catch(() => {});
@@ -7269,7 +7943,7 @@ exports.deleteSiteServer = secureOnCall({ timeoutSeconds: 60 }, async (request) 
     }
 
     const db = admin.firestore();
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin' || token.roleId === 'super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
     // Authorization: SuperAdmin or SITES_DELETE / MANAGE_SITES / SITES_MANAGE
@@ -7284,7 +7958,7 @@ exports.deleteSiteServer = secureOnCall({ timeoutSeconds: 60 }, async (request) 
         if (!saData || saData.isDisabled === true || saData.isActive === false) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission to delete sites.');
         }
-        let allowed = saData.roleId === 'role-super-admin';
+        let allowed = saData.roleId === 'role-super-admin' || saData.roleId === 'super-admin';
         if (!allowed && saData.roleId) {
             const roleSnap = await db.collection('roles').doc(saData.roleId).get();
             const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
@@ -7292,6 +7966,20 @@ exports.deleteSiteServer = secureOnCall({ timeoutSeconds: 60 }, async (request) 
         }
         if (!allowed) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission to delete sites.');
+        }
+    }
+
+    if (!isSuperAdmin) {
+        const saSnap = await db.collection('staff_accounts').doc(request.auth.uid).get();
+        const saData = saSnap.exists ? saSnap.data() : null;
+        const roleSnap = saData?.roleId ? await db.collection('roles').doc(saData.roleId).get() : null;
+        const roleData = roleSnap?.exists ? roleSnap.data() : null;
+        const hasGlobal = permissions.includes('MANAGE_ALL_SITES') || (roleData && Array.isArray(roleData.permissions) && roleData.permissions.includes('MANAGE_ALL_SITES'));
+        if (!hasGlobal) {
+            const managedSites = Array.isArray(token.sitesManaged) && token.sitesManaged.length > 0 ? token.sitesManaged : (Array.isArray(saData?.sitesManaged) ? saData.sitesManaged : []);
+            if (!managedSites.includes(siteId)) {
+                throw new functions.https.HttpsError('permission-denied', 'You can only delete sites within your assigned branch scope.');
+            }
         }
     }
 
@@ -7322,10 +8010,17 @@ exports.deleteSiteServer = secureOnCall({ timeoutSeconds: 60 }, async (request) 
         .where('status', '==', 'Active')
         .get();
 
-    if (!inviteSnap.empty) {
+    const trulyActiveInvites = inviteSnap.docs.filter(d => {
+        const inv = d.data();
+        const isCalendarExpired = inv.expiresAt ? new Date(inv.expiresAt).getTime() < Date.now() : false;
+        const isSingleUseConsumed = inv.isReusable === false && (inv.joined || 0) >= 1;
+        return !isCalendarExpired && !isSingleUseConsumed;
+    });
+
+    if (trulyActiveInvites.length > 0) {
         throw new functions.https.HttpsError(
             'failed-precondition',
-            `Cannot delete "${siteName || siteId}" because it is linked to ${inviteSnap.size} active referral invite link(s). Revoke these invites first.`
+            `Cannot delete "${siteName || siteId}" because it is linked to ${trulyActiveInvites.length} active referral invite link(s). Revoke these invites first.`
         );
     }
 
@@ -7403,11 +8098,14 @@ exports.deleteSiteServer = secureOnCall({ timeoutSeconds: 60 }, async (request) 
     const auditRef = db.collection('audit_logs').doc();
     batch.set(auditRef, {
         action: 'DELETE',
+        actionType: 'DELETE',
         category: 'SITES',
+        targetModule: 'SITES',
         targetId: siteId,
         targetName: resolvedSiteName,
         actorId: request.auth.uid,
         actorEmail: token.email || 'Admin',
+        actorName: token.name || token.email || 'Admin',
         details: `Deleted site "${resolvedSiteName}" and archived ${linkedVacancies.length} linked vacancy(ies) to Recycle Bin.`,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     });
@@ -7445,11 +8143,13 @@ exports.promoteEmployeeServer = secureOnCall({ timeoutSeconds: 60 }, async (requ
 
     const db = admin.firestore();
     const uid = request.auth.uid;
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin' || token.roleId === 'super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
     // Authorization check
     let hasPerm = isSuperAdmin ||
+        permissions.includes('EMPLOYEES_ACTION_PROMOTE') ||
+        permissions.includes('EMPLOYEES_EDIT_PROFILE') ||
         permissions.includes('EMPLOYEES_MANAGE_DEPLOYMENTS') ||
         permissions.includes('SUBMISSIONS_APPROVE');
 
@@ -7459,11 +8159,14 @@ exports.promoteEmployeeServer = secureOnCall({ timeoutSeconds: 60 }, async (requ
         if (!saData || saData.isDisabled === true || saData.isActive === false) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission to promote employees.');
         }
-        let allowed = saData.roleId === 'role-super-admin';
+        let allowed = saData.roleId === 'role-super-admin' || saData.roleId === 'super-admin';
         if (!allowed && saData.roleId) {
             const roleSnap = await db.collection('roles').doc(saData.roleId).get();
             const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
-            allowed = rolePerms.includes('EMPLOYEES_MANAGE_DEPLOYMENTS') || rolePerms.includes('SUBMISSIONS_APPROVE');
+            allowed = rolePerms.includes('EMPLOYEES_ACTION_PROMOTE') ||
+                rolePerms.includes('EMPLOYEES_EDIT_PROFILE') ||
+                rolePerms.includes('EMPLOYEES_MANAGE_DEPLOYMENTS') ||
+                rolePerms.includes('SUBMISSIONS_APPROVE');
         }
         if (!allowed) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission to promote employees.');
@@ -7526,6 +8229,7 @@ exports.promoteEmployeeServer = secureOnCall({ timeoutSeconds: 60 }, async (requ
 
     if (newSiteId) {
         updates.currentSiteId = newSiteId;
+        updates.assignedSiteIds = [newSiteId];
         if (newSiteName) updates.siteName = newSiteName;
     }
 
@@ -7563,11 +8267,14 @@ exports.promoteEmployeeServer = secureOnCall({ timeoutSeconds: 60 }, async (requ
     const auditRef = db.collection('audit_logs').doc();
     batch.set(auditRef, {
         action: 'PROMOTION',
+        actionType: 'UPDATE',
         category: 'EMPLOYEES',
+        targetModule: 'EMPLOYEES',
         targetId: employeeId,
         targetName: applicantName,
         actorId: uid,
         actorEmail: token.email || 'Admin',
+        actorName: token.name || token.email || 'Admin',
         details: `Promoted ${applicantName} (${employeeId}) from "${currentDesignation}" to "${newDesignation.trim()}" (Ref: ${cleanRefNo}).`,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     });
@@ -7602,7 +8309,7 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
     }
 
     const db = admin.firestore();
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin' || token.roleId === 'super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
 
     let hasBulkPerm = isSuperAdmin || permissions.includes('EMPLOYEES_IMPORT');
@@ -7612,7 +8319,7 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
         if (!saData || saData.isDisabled === true || saData.isActive === false) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission EMPLOYEES_IMPORT.');
         }
-        let allowed = saData.roleId === 'role-super-admin';
+        let allowed = saData.roleId === 'role-super-admin' || saData.roleId === 'super-admin';
         if (!allowed && saData.roleId) {
             const roleSnap = await db.collection('roles').doc(saData.roleId).get();
             const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
@@ -7696,9 +8403,14 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
 
                 const employeeRecord = {
                     applicantName: row.fullName.trim(),
+                    fullName: row.fullName.trim(),
                     employeeId: empId,
                     portalId: submissionId,
                     currentSiteId: siteId,
+                    siteId: siteId,
+                    assignedSiteIds: siteId ? [siteId] : [],
+                    activeAssignments: siteId ? [{ siteId, siteName, designation: (row.designation || 'Security Guard').trim(), assignedAt: nowIso }] : [],
+                    needsProfileCompletion: null,
                     siteName: siteName,
                     designation: (row.designation || 'Security Guard').trim(),
                     phoneNumber: row.phoneNumber || '',
@@ -7711,7 +8423,15 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
                     isDefaultPassword: true,
                     importedAt: nowIso,
                     importedBy: request.auth.uid,
+                    data: {
+                        fullName: row.fullName.trim(),
+                        applicantName: row.fullName.trim(),
+                        phoneNumber: row.phoneNumber || '',
+                        designation: (row.designation || 'Security Guard').trim(),
+                        ...(row.formData || {})
+                    },
                     profileData: {
+                        fullName: row.fullName.trim(),
                         applicantName: row.fullName.trim(),
                         phoneNumber: row.phoneNumber || '',
                         designation: (row.designation || 'Security Guard').trim(),
@@ -7732,13 +8452,13 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
                     }
                 }
 
-                const empRef = db.collection('employees').doc(empId);
+                const empRef = db.collection('employees').doc(submissionId);
                 const subRef = db.collection('onboarding_submissions').doc(submissionId);
 
                 // Skip existing employee documents when overwriteMode is 'skip' (UDF13-05)
                 if (overwriteMode === 'skip') {
-                    const existingEmpSnap = await empRef.get();
-                    if (existingEmpSnap.exists) {
+                    const existingEmpSnap = await db.collection('employees').where('employeeId', '==', empId).limit(1).get();
+                    if (!existingEmpSnap.empty) {
                         warnings.push({ row: rowNum, warning: `Skipped existing employee ID "${empId}".` });
                         continue;
                     }
@@ -7769,9 +8489,12 @@ exports.bulkImportEmployeesServer = secureOnCall({ timeoutSeconds: 300, memory: 
     // Server Audit Log
     await db.collection('audit_logs').add({
         action: 'BULK_IMPORT',
+        actionType: 'CREATE',
         category: 'EMPLOYEES',
+        targetModule: 'EMPLOYEES',
         actorId: request.auth.uid,
         actorEmail: token.email || 'Admin',
+        actorName: token.name || token.email || 'Admin',
         details: `Bulk imported ${successfulImports} employee(s) with ${failedImports} error(s).`,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     }).catch(() => {});
@@ -7814,9 +8537,19 @@ exports.recordDailyStreakServer = secureOnCall({ timeoutSeconds: 30 }, async (re
         if (token.employeeId === requestedId || token.portalId === requestedId || token.isSuperAdmin === true || token.isAdmin === true) {
             targetDocId = requestedId;
         } else {
-            const empCheck = await db.collection('employees').doc(requestedId).get();
-            if (empCheck.exists && (empCheck.data().uid === uid || empCheck.data().linkedUid === uid)) {
-                targetDocId = requestedId;
+            const empCheck = await resolveEmployeeDocAdmin(db, requestedId);
+            if (empCheck && empCheck.exists && (empCheck.data().uid === uid || empCheck.data().linkedUid === uid)) {
+                targetDocId = empCheck.id;
+            }
+        }
+    } else if (targetDocId === uid) {
+        const empSnap = await db.collection('employees').where('uid', '==', uid).limit(1).get();
+        if (!empSnap.empty) {
+            targetDocId = empSnap.docs[0].id;
+        } else {
+            const linkedSnap = await db.collection('employees').where('linkedUid', '==', uid).limit(1).get();
+            if (!linkedSnap.empty) {
+                targetDocId = linkedSnap.docs[0].id;
             }
         }
     }
@@ -7837,109 +8570,190 @@ exports.recordDailyStreakServer = secureOnCall({ timeoutSeconds: 30 }, async (re
     const yDay = String(dYest.getDate()).padStart(2, '0');
     const yesterday = `${yYear}-${yMonth}-${yDay}`;
 
-    // Read streak points from gamification_rules
+    // Read streak points & attendance points from gamification_rules
     let streakPoints = 1;
+    let attendancePoints = 5;
     try {
         const rulesSnap = await db.collection('settings').doc('gamification_rules').get();
         if (rulesSnap.exists) {
-            streakPoints = rulesSnap.data().streakPoints ?? 1;
+            const rData = rulesSnap.data() || {};
+            streakPoints = rData.streakPoints ?? 1;
+            attendancePoints = rData.attendancePoints ?? 5;
         }
     } catch (e) {
         console.warn('[recordDailyStreakServer] Failed to read gamification_rules:', e);
     }
 
+    const isAttendanceCheckIn = Boolean(request.data && (request.data.action === 'attendance' || request.data.isAttendanceCheckIn === true));
     const engagementRef = db.collection('user_engagement').doc(targetDocId);
     let streakResult = null;
 
     await db.runTransaction(async (transaction) => {
         const streakSnap = await transaction.get(engagementRef);
-
-        if (!streakSnap.exists) {
-            streakResult = {
-                userId: targetDocId,
-                userName,
-                streakCount: 1,
-                lastVisitDate: today,
-                points: streakPoints
-            };
-            transaction.set(engagementRef, {
-                ...streakResult,
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-            });
-
-            // Log to gamification_logs
-            const logRef = db.collection('gamification_logs').doc();
-            transaction.set(logRef, {
-                userId: targetDocId,
-                type: 'STREAK',
-                streakCount: 1,
-                pointsAwarded: streakPoints,
-                date: today,
-                timestamp: admin.firestore.FieldValue.serverTimestamp()
-            });
-            return;
-        }
-
-        const data = streakSnap.data();
-        const lastVisit = data.lastVisitDate;
-        let newCount = data.streakCount || 0;
-        let currentPoints = data.points || 0;
-
-        if (lastVisit === today) {
-            // Already visited today — keep existing streak and points
-            streakResult = {
-                userId: targetDocId,
-                userName: data.userName || userName,
-                streakCount: newCount,
-                lastVisitDate: today,
-                points: currentPoints,
-                alreadyRecordedToday: true
-            };
-            return;
-        } else if (lastVisit === yesterday) {
-            // Consecutive visit
-            newCount += 1;
-            currentPoints += streakPoints;
-        } else {
-            // Broken streak, reset to 1
-            newCount = 1;
-            currentPoints += streakPoints;
-        }
-
-        streakResult = {
-            userId: targetDocId,
-            userName,
-            streakCount: newCount,
-            lastVisitDate: today,
-            points: currentPoints
-        };
-
-        transaction.set(engagementRef, {
-            ...streakResult,
-            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        // Dual-ID Sync (UDF13-04)
+        let uidSnap = null;
         if (targetDocId !== uid) {
-            transaction.set(db.collection('user_engagement').doc(uid), {
-                ...streakResult,
-                userId: uid,
-                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
+            uidSnap = await transaction.get(db.collection('user_engagement').doc(uid));
         }
 
-        // Log streak points with dual user reference (UDF13-04)
-        const logRef = db.collection('gamification_logs').doc();
-        transaction.set(logRef, {
-            userId: targetDocId,
-            userUid: uid,
-            type: 'STREAK',
-            streakCount: newCount,
-            pointsAwarded: streakPoints,
-            date: today,
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
+        const existingUidPoints = (uidSnap && uidSnap.exists) ? (uidSnap.data().points || 0) : 0;
+
+        if (isAttendanceCheckIn) {
+            // Shift Attendance Points Flow (UDF-AUD-16 & UDF-AUD-112)
+            if (!streakSnap.exists) {
+                const totalPoints = existingUidPoints + attendancePoints;
+                streakResult = {
+                    userId: targetDocId,
+                    userName,
+                    streakCount: (uidSnap && uidSnap.exists) ? (uidSnap.data().streakCount || 1) : 1,
+                    lastVisitDate: today,
+                    lastAttendanceDate: today,
+                    points: totalPoints
+                };
+                transaction.set(engagementRef, {
+                    ...streakResult,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                const logRef = db.collection('gamification_logs').doc();
+                transaction.set(logRef, {
+                    userId: targetDocId,
+                    userUid: uid,
+                    type: 'ATTENDANCE',
+                    pointsAwarded: attendancePoints,
+                    date: today,
+                    timestamp: admin.firestore.FieldValue.serverTimestamp()
+                });
+            } else {
+                const data = streakSnap.data() || {};
+                const lastAttendance = data.lastAttendanceDate;
+                const currentPoints = data.points || 0;
+
+                if (lastAttendance === today) {
+                    // Already awarded attendance points today
+                    streakResult = {
+                        userId: targetDocId,
+                        userName: data.userName || userName,
+                        streakCount: data.streakCount || 1,
+                        lastVisitDate: data.lastVisitDate || today,
+                        lastAttendanceDate: today,
+                        points: currentPoints,
+                        alreadyRecordedAttendanceToday: true
+                    };
+                } else {
+                    const newPoints = currentPoints + attendancePoints;
+                    streakResult = {
+                        userId: targetDocId,
+                        userName: data.userName || userName,
+                        streakCount: data.streakCount || 1,
+                        lastVisitDate: data.lastVisitDate || today,
+                        lastAttendanceDate: today,
+                        points: newPoints
+                    };
+                    transaction.set(engagementRef, {
+                        points: newPoints,
+                        lastAttendanceDate: today,
+                        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+
+                    const logRef = db.collection('gamification_logs').doc();
+                    transaction.set(logRef, {
+                        userId: targetDocId,
+                        userUid: uid,
+                        type: 'ATTENDANCE',
+                        pointsAwarded: attendancePoints,
+                        date: today,
+                        timestamp: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                }
+            }
+        } else {
+            // Standard Daily Login Streak Visit Flow
+            if (!streakSnap.exists) {
+                const totalPoints = existingUidPoints + streakPoints;
+                streakResult = {
+                    userId: targetDocId,
+                    userName,
+                    streakCount: (uidSnap && uidSnap.exists) ? (uidSnap.data().streakCount || 1) : 1,
+                    lastVisitDate: today,
+                    points: totalPoints
+                };
+                transaction.set(engagementRef, {
+                    ...streakResult,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                // Log to gamification_logs
+                const logRef = db.collection('gamification_logs').doc();
+                transaction.set(logRef, {
+                    userId: targetDocId,
+                    userUid: uid,
+                    type: 'STREAK',
+                    streakCount: 1,
+                    pointsAwarded: streakPoints,
+                    date: today,
+                    timestamp: admin.firestore.FieldValue.serverTimestamp()
+                });
+            } else {
+                const data = streakSnap.data();
+                const lastVisit = data.lastVisitDate;
+                let newCount = data.streakCount || 0;
+                let currentPoints = data.points || 0;
+
+                if (lastVisit === today) {
+                    // Already visited today — keep existing streak and points
+                    streakResult = {
+                        userId: targetDocId,
+                        userName: data.userName || userName,
+                        streakCount: newCount,
+                        lastVisitDate: today,
+                        points: currentPoints,
+                        alreadyRecordedToday: true
+                    };
+                } else {
+                    if (lastVisit === yesterday) {
+                        // Consecutive visit
+                        newCount += 1;
+                        currentPoints += streakPoints;
+                    } else {
+                        // Broken streak, reset to 1
+                        newCount = 1;
+                        currentPoints += streakPoints;
+                    }
+
+                    streakResult = {
+                        userId: targetDocId,
+                        userName,
+                        streakCount: newCount,
+                        lastVisitDate: today,
+                        points: currentPoints
+                    };
+
+                    transaction.set(engagementRef, {
+                        ...streakResult,
+                        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+
+                    // Log streak points with dual user reference (UDF13-04)
+                    const logRef = db.collection('gamification_logs').doc();
+                    transaction.set(logRef, {
+                        userId: targetDocId,
+                        userUid: uid,
+                        type: 'STREAK',
+                        streakCount: newCount,
+                        pointsAwarded: streakPoints,
+                        date: today,
+                        timestamp: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                }
+            }
+        }
+
+        // Clean up redundant duplicate uid document if present to prevent duplicate leaderboard entries (UDF-AUD-177)
+        if (targetDocId !== uid && uidSnap && uidSnap.exists) {
+            transaction.delete(db.collection('user_engagement').doc(uid));
+        }
     });
 
     return {
@@ -7984,9 +8798,19 @@ exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request
         if (token.employeeId === requestedId || token.portalId === requestedId || token.isSuperAdmin === true || token.isAdmin === true) {
             targetDocId = requestedId;
         } else {
-            const empCheck = await db.collection('employees').doc(requestedId).get();
-            if (empCheck.exists && (empCheck.data().uid === uid || empCheck.data().linkedUid === uid)) {
-                targetDocId = requestedId;
+            const empCheck = await resolveEmployeeDocAdmin(db, requestedId);
+            if (empCheck && empCheck.exists && (empCheck.data().uid === uid || empCheck.data().linkedUid === uid)) {
+                targetDocId = empCheck.id;
+            }
+        }
+    } else if (targetDocId === uid) {
+        const empSnap = await db.collection('employees').where('uid', '==', uid).limit(1).get();
+        if (!empSnap.empty) {
+            targetDocId = empSnap.docs[0].id;
+        } else {
+            const linkedSnap = await db.collection('employees').where('linkedUid', '==', uid).limit(1).get();
+            if (!linkedSnap.empty) {
+                targetDocId = linkedSnap.docs[0].id;
             }
         }
     }
@@ -8018,14 +8842,23 @@ exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request
     const redemptionRef = db.collection('reward_redemptions').doc();
     const logRef = db.collection('gamification_logs').doc();
 
-    const randToken = Math.random().toString(36).substring(2, 7).toUpperCase();
+    const crypto = require('crypto');
+    const randToken = crypto.randomBytes(4).toString('hex').toUpperCase();
     const year = new Date().getFullYear();
     const voucherCode = `UDF-RWD-${year}-${randToken}`;
     let remainingPoints = 0;
 
     await db.runTransaction(async (transaction) => {
         const engagementSnap = await transaction.get(engagementRef);
-        const currentPoints = engagementSnap.exists ? (engagementSnap.data().points || 0) : 0;
+        let uidSnap = null;
+        if (targetDocId !== uid) {
+            uidSnap = await transaction.get(db.collection('user_engagement').doc(uid));
+        }
+
+        let currentPoints = engagementSnap.exists ? (engagementSnap.data().points || 0) : 0;
+        if (!engagementSnap.exists && uidSnap && uidSnap.exists) {
+            currentPoints = uidSnap.data().points || 0;
+        }
 
         if (currentPoints < verifiedCost) {
             throw new functions.https.HttpsError(
@@ -8042,12 +8875,9 @@ exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request
             lastUpdated: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        // Dual-ID Sync (UDF13-04)
-        if (targetDocId !== uid) {
-            transaction.set(db.collection('user_engagement').doc(uid), {
-                points: remainingPoints,
-                lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
+        // Clean up redundant duplicate uid document if present to prevent duplicate leaderboard entries (UDF-AUD-177)
+        if (targetDocId !== uid && uidSnap && uidSnap.exists) {
+            transaction.delete(db.collection('user_engagement').doc(uid));
         }
 
         // Create redemption record
@@ -8079,7 +8909,7 @@ exports.redeemRewardServer = secureOnCall({ timeoutSeconds: 30 }, async (request
         success: true,
         redemptionId: redemptionRef.id,
         voucherCode,
-        pointsSpent: cost,
+        pointsSpent: verifiedCost,
         remainingPoints
     };
 });
@@ -8097,6 +8927,10 @@ exports.sendNotificationServer = secureOnCall({ timeoutSeconds: 30 }, async (req
     if (token.isDisabled === true) {
         throw new functions.https.HttpsError('permission-denied', 'Account is disabled.');
     }
+    // Reject anonymous users from dispatching system notifications (UDF-AUD-108)
+    if (token.firebase?.sign_in_provider === 'anonymous' || token.provider_id === 'anonymous') {
+        throw new functions.https.HttpsError('permission-denied', 'Anonymous users cannot dispatch system notifications.');
+    }
 
     const { targetUserId, message, type, link, metadata, id: clientProvidedId } = request.data || {};
 
@@ -8108,7 +8942,7 @@ exports.sendNotificationServer = secureOnCall({ timeoutSeconds: 30 }, async (req
     }
 
     const uid = request.auth.uid;
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin' || token.roleId === 'super-admin';
     const isAdmin = isSuperAdmin || token.isAdmin === true || token.type === 'Staff' || !!token.roleId;
 
     const trimmedTarget = targetUserId.trim();
@@ -8118,11 +8952,10 @@ exports.sendNotificationServer = secureOnCall({ timeoutSeconds: 30 }, async (req
     const isBroadcast = trimmedTarget.startsWith('ROLE:') || trimmedTarget === 'all_admins' || trimmedTarget === 'admin';
 
     if (isBroadcast) {
-        const isEmployeeBroadcast = trimmedTarget === 'ROLE:employee' || trimmedTarget === 'ROLE:role-security-guard';
-        if (isEmployeeBroadcast && !isAdmin) {
+        if (!isAdmin && trimmedTarget.startsWith('ROLE:')) {
             throw new functions.https.HttpsError('permission-denied', 'Only administrators can broadcast role-based notifications.');
         }
-        // Non-admins can message 'all_admins', 'admin', or workflow roles
+        // Non-admins can message 'all_admins' or 'admin'
     } else {
         // Individual recipient check: Non-admins can send notifications addressed to themselves, an admin, or workflow approver
         const isSelf = (trimmedTarget === uid || trimmedTarget === token.employeeId || trimmedTarget === token.portalId);
@@ -8136,7 +8969,15 @@ exports.sendNotificationServer = secureOnCall({ timeoutSeconds: 30 }, async (req
             }
         }
     }
-    const notifId = (typeof clientProvidedId === 'string' && clientProvidedId.trim()) ? clientProvidedId.trim() : db.collection('notifications').doc().id;
+    // Document collision / overwrite protection (UDF-AUD-108)
+    let notifId = db.collection('notifications').doc().id;
+    if (typeof clientProvidedId === 'string' && clientProvidedId.trim()) {
+        const candidateId = clientProvidedId.trim();
+        const existingSnap = await db.collection('notifications').doc(candidateId).get();
+        if (!existingSnap.exists) {
+            notifId = candidateId;
+        }
+    }
 
     const notifDoc = {
         id: notifId,
@@ -8146,6 +8987,7 @@ exports.sendNotificationServer = secureOnCall({ timeoutSeconds: 30 }, async (req
         link: link || null,
         metadata: metadata || null,
         read: false,
+        readBy: [],
         senderId: uid,
         senderName: token.name || token.email || 'System',
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -8194,11 +9036,12 @@ exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (re
         throw new functions.https.HttpsError('invalid-argument', 'action must be "APPROVE" or "REJECT".');
     }
 
-    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin';
+    const isSuperAdmin = token.isSuperAdmin === true || token.roleId === 'role-super-admin' || token.roleId === 'super-admin';
     const permissions = Array.isArray(token.permissions) ? token.permissions : [];
     let hasBgvPerm = isSuperAdmin ||
         permissions.includes('BGV_APPROVE_REJECT') ||
-        permissions.includes('BGV_MANAGE');
+        permissions.includes('BGV_MANAGE') ||
+        permissions.includes('BGV_UPLOAD_CERTIFICATE');
 
     const db = admin.firestore();
     if (!hasBgvPerm) {
@@ -8207,11 +9050,11 @@ exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (re
         if (!saData || saData.isDisabled === true || saData.isActive === false) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission to approve or reject BGV.');
         }
-        let allowed = saData.roleId === 'role-super-admin';
+        let allowed = saData.roleId === 'role-super-admin' || saData.roleId === 'super-admin';
         if (!allowed && saData.roleId) {
             const roleSnap = await db.collection('roles').doc(saData.roleId).get();
             const rolePerms = (roleSnap.exists && Array.isArray(roleSnap.data().permissions)) ? roleSnap.data().permissions : [];
-            allowed = rolePerms.includes('BGV_APPROVE_REJECT') || rolePerms.includes('BGV_MANAGE');
+            allowed = rolePerms.includes('BGV_APPROVE_REJECT') || rolePerms.includes('BGV_MANAGE') || rolePerms.includes('BGV_UPLOAD_CERTIFICATE');
         }
         if (!allowed) {
             throw new functions.https.HttpsError('permission-denied', 'Missing permission to approve or reject BGV.');
@@ -8233,7 +9076,8 @@ exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (re
 
     // Multi-tenant site check for BGV (UDF13-06)
     if (empSiteId && !isSuperAdmin) {
-        const hasGlobalScope = permissions.includes('EMPLOYEES_VIEW_SCOPE_ALL') ||
+        const hasGlobalScope = permissions.includes('BGV_VIEW_SCOPE_ALL') ||
+            permissions.includes('EMPLOYEES_VIEW_SCOPE_ALL') ||
             permissions.includes('SUBMISSIONS_VIEW_SCOPE_ALL') ||
             permissions.includes('MANAGE_SITES') ||
             permissions.includes('MANAGE_ALL_SITES');
@@ -8325,10 +9169,13 @@ exports.completeBgvReviewServer = secureOnCall({ timeoutSeconds: 60 }, async (re
     const auditRef = db.collection('audit_logs').doc();
     batch.set(auditRef, {
         action: action === 'APPROVE' ? 'BGV_APPROVE' : 'BGV_REJECT',
+        actionType: action === 'APPROVE' ? 'APPROVAL' : 'REJECTION',
         category: 'BGV',
+        targetModule: 'BGV',
         targetId: recordId,
         actorId: request.auth.uid,
         actorEmail: token.email || 'Admin',
+        actorName: approverName || token.name || 'Admin',
         details: `${approverName} marked BGV for ${targetEmpId || recordId} as "${finalStatus}". Notes/Reason: ${notes || rejectionReason || 'None'}`,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     });

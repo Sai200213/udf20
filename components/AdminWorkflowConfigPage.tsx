@@ -28,10 +28,11 @@ const AdminWorkflowConfigPage: React.FC<AdminWorkflowConfigPageProps> = ({ workf
     setWorkflowConfigs(prev => prev.map(config => {
       if (config.moduleId === moduleId) {
         const nextLevel = config.levels.length + 1;
+        const activeRoles = roles.filter(r => !r.isDisabled);
         if(logAction) logAction('UPDATE', 'SYSTEM', `Added Level ${nextLevel} to ${moduleId} workflow`);
         return {
           ...config,
-          levels: [...config.levels, { level: nextLevel, roleId: roles[0]?.id || '' }]
+          levels: [...config.levels, { level: nextLevel, roleId: activeRoles[0]?.id || roles[0]?.id || '' }]
         };
       }
       return config;
@@ -100,7 +101,7 @@ const AdminWorkflowConfigPage: React.FC<AdminWorkflowConfigPageProps> = ({ workf
                   value={lvl.roleId} 
                   onChange={e => updateLevelRole(moduleId, lvl.level, e.target.value)}
                 >
-                  {roles.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                  {roles.filter(r => !r.isDisabled).map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
                 </Select>
               </div>
               {config.levels.length > 1 && (
@@ -338,6 +339,7 @@ const AdminWorkflowConfigPage: React.FC<AdminWorkflowConfigPageProps> = ({ workf
                                                             else if (val === 'alphanumeric') updateClientIdDefinition(def.id, { pattern: '^[a-zA-Z0-9]*$', patternMessage: 'Letters & numbers only' });
                                                             else if (val === 'alpha') updateClientIdDefinition(def.id, { pattern: '^[a-zA-Z ]*$', patternMessage: 'Letters only' });
                                                             else if (val === 'alphanumeric-symbols') updateClientIdDefinition(def.id, { pattern: '^[a-zA-Z0-9!@#$%^&*()_+\\-=\\[\\]{};\':"\\\\|,.<>\\/? ]*$', patternMessage: 'Letters, numbers & symbols only' });
+                                                            else if (val === 'custom') updateClientIdDefinition(def.id, { pattern: '^[A-Z0-9-]*$', patternMessage: 'Custom format' });
                                                         }}
                                                     >
                                                         <option value="none">Any Characters</option>

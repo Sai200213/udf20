@@ -223,9 +223,7 @@ const AdminPortalPage: React.FC<AdminPortalPageProps> = (props) => {
   useEffect(() => {
     switch (currentAdminView) {
       case AppView.ADMIN_DASHBOARD:
-        ensureModuleSubscribed('LEAVES');
-        ensureModuleSubscribed('ACCOUNT_UPDATES');
-        ensureModuleSubscribed('RESIGNATIONS');
+        // Dashboard uses lightweight aggregated stats (UDF-AUD-61)
         break;
       case AppView.ADMIN_PORTAL_MASTER_EMPLOYEE_LIST:
         ensureModuleSubscribed('LEAVES');
@@ -310,6 +308,16 @@ const AdminPortalPage: React.FC<AdminPortalPageProps> = (props) => {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [isSidebarHovered, setIsSidebarHovered] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  const handleSignOut = () => {
+    try {
+      sessionStorage.removeItem('activeTimelineEmployeeId');
+      sessionStorage.removeItem('adminTimelineSearchQuery');
+      sessionStorage.removeItem('activeStaffProfileId');
+    } catch {}
+    setActiveTimelineEmployeeId(null);
+    onLogout();
+  };
 
   const isSidebarExpanded = !isSidebarCollapsed || isSidebarHovered;
 
@@ -528,9 +536,10 @@ const AdminPortalPage: React.FC<AdminPortalPageProps> = (props) => {
         if (!hasPermission(Permission.MANAGE_SYSTEM)) return accessDenied;
         return <AdminWebsiteManager isSuperAdmin={isSuperAdmin} userRole={userRole} />;
       case AppView.ADMIN_PORTAL_TIMELINE_SEARCH:
-        if (!isSuperAdmin) return <div className="p-8 text-center text-red-500 font-semibold">Access Denied. Super Admin only.</div>;
+        if (!isSuperAdmin && !hasPermission(Permission.EMPLOYEES_VIEW) && !hasPermission(Permission.EMPLOYEES_VIEW_TIMELINE)) return <div className="p-8 text-center text-red-500 font-semibold">Access Denied.</div>;
         return (
           <AdminTimelineSearchPage
+            allowedSiteIds={allowedSiteIds}
             onViewTimeline={(empId) => {
               setActiveTimelineEmployeeId(empId);
               try {
@@ -793,6 +802,7 @@ const AdminPortalPage: React.FC<AdminPortalPageProps> = (props) => {
             sections={sections}
             isSuperAdmin={isSuperAdmin}
             userRole={userRole}
+            authUser={authUser}
             onNotify={addToast}
             logAction={logAction}
           />
@@ -805,6 +815,7 @@ const AdminPortalPage: React.FC<AdminPortalPageProps> = (props) => {
         if (!currentTimelineId) {
           return (
             <AdminTimelineSearchPage
+              allowedSiteIds={allowedSiteIds}
               onViewTimeline={(empId) => {
                 setActiveTimelineEmployeeId(empId);
                 try {
@@ -825,13 +836,17 @@ const AdminPortalPage: React.FC<AdminPortalPageProps> = (props) => {
                   sessionStorage.removeItem('activeTimelineEmployeeId');
                 } catch {}
                 setActiveTimelineEmployeeId(null);
-                navigateTo(AppView.ADMIN_PORTAL_TIMELINE_SEARCH);
+                if (isSuperAdmin || hasPermission(Permission.EMPLOYEES_VIEW_TIMELINE)) {
+                  navigateTo(AppView.ADMIN_PORTAL_TIMELINE_SEARCH);
+                } else {
+                  navigateTo(AppView.ADMIN_PORTAL_MASTER_EMPLOYEE_LIST);
+                }
               }}
             />
           </div>
         );
       case AppView.ADMIN_PORTAL_BGV_MANAGEMENT:
-        if (!hasPermission(Permission.BGV_VIEW) && !hasPermission(Permission.BGV_MANAGE)) return accessDenied;
+        if (!isSuperAdmin && !hasPermission(Permission.BGV_VIEW) && !hasPermission(Permission.BGV_MANAGE) && !hasPermission(Permission.BGV_VENDOR)) return accessDenied;
         return (
           <AdminBgvManagementPage
             authUser={authUser}
@@ -850,7 +865,7 @@ const AdminPortalPage: React.FC<AdminPortalPageProps> = (props) => {
         if (!isSuperAdmin && !hasPermission(Permission.MANAGE_SYSTEM) && !hasPermission(Permission.EMPLOYEES_IMPORT)) return accessDenied;
         return <AdminLegacySystemsPage logAction={logAction} />;
       case AppView.ADMIN_PORTAL_GRIEVANCES:
-        if (!isSuperAdmin && !hasPermission(Permission.GRIEVANCES_VIEW) && !hasPermission(Permission.REWARDS_VIEW) && !hasPermission(Permission.REWARDS_MANAGE)) {
+        if (!isSuperAdmin && !hasPermission(Permission.GRIEVANCES_VIEW) && !hasPermission(Permission.REWARDS_VIEW) && !hasPermission(Permission.REWARDS_MANAGE) && !hasPermission(Permission.MANAGE_SYSTEM)) {
           return accessDenied;
         }
         return (
@@ -1073,7 +1088,7 @@ const AdminPortalPage: React.FC<AdminPortalPageProps> = (props) => {
               </div>
             </div>
           )}
-          <Button onClick={onLogout} variant="secondary" size="sm" className={`w-full !bg-red-600/10 hover:!bg-red-600 !text-red-400 hover:!text-white border border-red-900/30 transition-colors ${!isSidebarExpanded ? 'px-0 justify-center' : ''}`} title="Logout">
+          <Button onClick={handleSignOut} variant="secondary" size="sm" className={`w-full !bg-red-600/10 hover:!bg-red-600 !text-red-400 hover:!text-white border border-red-900/30 transition-colors ${!isSidebarExpanded ? 'px-0 justify-center' : ''}`} title="Logout">
             <LogOut size={18} className={isSidebarExpanded ? 'mr-2' : ''} />
             {isSidebarExpanded && 'Sign Out'}
           </Button>

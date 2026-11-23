@@ -1,7 +1,7 @@
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import ProfileAvatar from '../ProfileAvatar';
-import { SubmittedFormData, FormField, FieldType, FormSection, PortalConfig } from '../../types';
+import { SubmittedFormData, FormField, FieldType, FormSection, PortalConfig, Permission } from '../../types';
 import { useData } from '../../src/contexts/DataContext';
 
 // Import employee-specific field components for read-only display
@@ -12,7 +12,7 @@ import EmployeeDateField from '../employeeFormFields/EmployeeDateField';
 import EmployeeCheckboxField from '../employeeFormFields/EmployeeCheckboxField';
 import EmployeeRadioField from '../employeeFormFields/EmployeeRadioField';
 import EmployeeFileUploadField from '../employeeFormFields/EmployeeFileUploadField';
-import { FileText, Image as ImageIcon, ExternalLink, Download, Tag, ShieldHalf, AlertTriangle } from 'lucide-react';
+import { FileText, Image as ImageIcon, ExternalLink, Download, Tag, ShieldHalf, AlertTriangle, X } from 'lucide-react';
 import SecureDocumentLink, { SecureImage } from '../../src/components/common/SecureDocumentLink';
 import RequestCorrectionModal from '../common/RequestCorrectionModal';
 import Button from '../common/Button';
@@ -35,18 +35,26 @@ const EmployeeProfileView: React.FC<EmployeeProfileViewProps> = ({
   isAdmin,
   adminName
 }) => {
-  const { sites: contextSites } = useData();
+  const { sites: contextSites, userRole, isSuperAdmin } = useData();
   const sites = propSites || contextSites; // Fallback to context if prop is missing
 
   const pendingFieldsList: string[] = (employeeData as any)?.pendingProfileFields || [];
   const isIncompleteProfile = (employeeData as any)?.profileCompletionStatus === 'INCOMPLETE';
   const pendingProfileNote: string | undefined = (employeeData as any)?.pendingProfileNote;
 
+  const dataMap = useMemo(() => {
+    return {
+      ...(employeeData.formData || {}),
+      ...((employeeData as any).profileData || {}),
+      ...(employeeData.data || {})
+    };
+  }, [employeeData]);
+
   const renderReadOnlyField = (field: FormField, value: any) => {
     const isPlaceholderValue = (v: any) => {
       if (v === null || v === undefined) return true;
       const s = String(v).trim().toLowerCase();
-      return s === '' || ['na', 'n/a', 'n.a.', 'none', 'nil', 'nil.', '-', '--', '0', '00', '0000', '000000000000'].includes(s);
+      return s === '' || ['na', 'n/a', 'n.a.', 'none', 'nil', 'nil.', '-', '--', '00', '0000', '000000000000'].includes(s);
     };
 
     const isFieldPending = pendingFieldsList.includes(field.id) ||
@@ -260,8 +268,6 @@ const EmployeeProfileView: React.FC<EmployeeProfileViewProps> = ({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [popoverSite]);
 
-  const dataMap = employeeData.data || employeeData.formData || {};
-
   const rawDesignation = employeeData.designation || (designationFieldId ? dataMap[designationFieldId] : null);
   const displayDesignation = rawDesignation && rawDesignation !== 'N/A' ? rawDesignation : null;
 
@@ -289,7 +295,7 @@ const EmployeeProfileView: React.FC<EmployeeProfileViewProps> = ({
               userName={employeeData.applicantName || employeeData.employeeId || 'Employee'}
               currentPhotoURL={employeeData.profilePhotoURL}
               size={120}
-              editable={true}
+              editable={isSuperAdmin || Boolean(userRole?.permissions?.includes(Permission.EMPLOYEES_EDIT_PROFILE))}
               collection="employees"
             />
           </div>
@@ -347,7 +353,7 @@ const EmployeeProfileView: React.FC<EmployeeProfileViewProps> = ({
                     </React.Fragment>
                   );
                 })}
-              {isAdmin && (
+              {isAdmin && (isSuperAdmin || userRole?.permissions?.includes(Permission.EMPLOYEES_REQUEST_CORRECTION) || userRole?.permissions?.includes(Permission.SUBMISSIONS_CREATE_CORRECTION_LINK)) && (
                 <Button
                   variant="secondary"
                   size="sm"
@@ -370,8 +376,8 @@ const EmployeeProfileView: React.FC<EmployeeProfileViewProps> = ({
                     <ShieldHalf size={16} className="text-white/80" />
                     <span className="text-[11px] font-bold text-white uppercase tracking-widest">{popoverSite.name} Identifiers</span>
                   </div>
-                  <button onClick={() => setPopoverSite(null)} className="text-white/60 hover:text-white transition-colors">
-                    <ExternalLink size={14} />
+                  <button onClick={() => setPopoverSite(null)} aria-label="Close" className="text-white/60 hover:text-white transition-colors">
+                    <X size={14} />
                   </button>
                 </div>
                 <div className="p-5 space-y-4">
@@ -457,10 +463,11 @@ const EmployeeProfileView: React.FC<EmployeeProfileViewProps> = ({
 
       <div className="space-y-8">
         {[...(sectionsToRender)].sort((a, b) => a.order - b.order).map((section, idx) => {
-            const filteredFields = (section.fields || []).filter(f => 
-              !f.label?.toLowerCase().includes('client id') &&
-              !f.label?.toLowerCase().includes('client-specific id')
-            );
+            const filteredFields = (section.fields || []).filter(f => {
+              if (f.label?.toLowerCase().includes('client id') || f.label?.toLowerCase().includes('client-specific id')) return false;
+              if (userRole?.fieldVisibility?.[f.id] === 'HIDDEN' && !isSuperAdmin) return false;
+              return true;
+            });
             
             if (filteredFields.length === 0) return null;
 
@@ -477,11 +484,14 @@ const EmployeeProfileView: React.FC<EmployeeProfileViewProps> = ({
                 
                 <div className="p-8">
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-8">
-                    {[...filteredFields].sort((a, b) => a.order - b.order).map(field => (
-                      <div key={field.id} className={`${field.type === FieldType.TEXTAREA ? 'sm:col-span-2 lg:col-span-3' : ''}`}>
-                        {renderReadOnlyField(field, (employeeData.data || {})[field.id])}
-                      </div>
-                    ))}
+                    {[...filteredFields].sort((a, b) => a.order - b.order).map(field => {
+                      const val = dataMap[field.id] ?? (employeeData.data || {})[field.id];
+                      return (
+                        <div key={field.id} className={`${field.type === FieldType.TEXTAREA ? 'sm:col-span-2 lg:col-span-3' : ''}`}>
+                          {renderReadOnlyField(field, val)}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>

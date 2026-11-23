@@ -4,37 +4,32 @@ import PublicHeader from './common/PublicHeader';
 import PublicFooter from './common/PublicFooter';
 import { ShieldCheck, MapPin, Users, Award, Shield, CheckCircle, ArrowLeft } from 'lucide-react';
 import { getWebsiteConfig, WebsiteServiceData } from '../src/services/websiteService';
-import AdSenseUnit from './common/AdSenseUnit';
 import SEOHead from '../src/components/common/SEOHead';
 
 const AboutPage: React.FC = () => {
     const navigate = useNavigate();
     const [config, setConfig] = useState<WebsiteServiceData | null>(null);
-    const [loading, setLoading] = useState(true);
 
     useEffect(() => {
         window.scrollTo(0, 0);
+        let isMounted = true;
 
         const loadData = async () => {
             try {
                 const data = await getWebsiteConfig();
-                setConfig(data);
+                if (isMounted && data) {
+                    setConfig(data);
+                }
             } catch (err) {
                 console.error("Failed to load about page config", err);
-            } finally {
-                setLoading(false);
             }
         };
         loadData();
-    }, []);
 
-    if (loading) {
-        return (
-            <div className="min-h-screen flex items-center justify-center bg-slate-50">
-                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
-            </div>
-        );
-    }
+        return () => {
+            isMounted = false;
+        };
+    }, []);
 
     return (
         <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
@@ -67,11 +62,6 @@ const AboutPage: React.FC = () => {
                     <ArrowLeft className="mr-1.5 h-4 w-4 transform group-hover:-translate-x-1 transition-transform" />
                     Back to Homepage
                 </button>
-
-                {/* Top Ad Unit */}
-                <div className="my-6 max-w-6xl mx-auto">
-                    <AdSenseUnit slot="5555555555" format="horizontal" />
-                </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
                     
@@ -138,11 +128,6 @@ const AboutPage: React.FC = () => {
                                     <span className="text-[10px] text-blue-200 uppercase font-bold tracking-wider">Client Sites</span>
                                 </div>
                             </div>
-                        </div>
-
-                        {/* Ad Unit side column */}
-                        <div>
-                            <AdSenseUnit slot="6666666666" format="rectangle" />
                         </div>
                     </div>
 

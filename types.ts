@@ -64,6 +64,7 @@ export interface EmployeeFieldProps {
   disabled?: boolean;
   /** Optional map from option value to display label (e.g. siteId → siteName). */
   optionLabels?: Record<string, string>;
+  draftId?: string;
 }
 
 // --- RBAC & Workflow Types ---
@@ -376,6 +377,9 @@ export interface LeaveBalance {
     total: number;
     used: number;
   }>;
+  portalId?: string;
+  id?: string;
+  uid?: string | null;
 }
 
 export enum DisciplinaryActionType {
@@ -560,6 +564,7 @@ export interface Notification {
   type: 'success' | 'error' | 'info' | 'warning';
   message: string;
   read: boolean;
+  readBy?: string[]; // User IDs who have marked this notification read (UDF-AUD-175)
   timestamp: string;
   link?: string; // AppView string for navigation
 }
@@ -600,6 +605,7 @@ export interface OnboardingSubmission {
   linkedGoogleEmail?: string; // Optional: Google email linked during onboarding
   legacyImportId?: string; // Optional: ID from legacy_employee_imports
   inviteId?: string;
+  referralJoinedRecorded?: boolean;
   recruitedBy?: string;
   recruitedByName?: string;
   duplicateCheck?: DuplicateCheckResult;
@@ -688,6 +694,7 @@ export interface FirestoreEmployee {
   profilePhotoURL?: string; // Firebase Storage URL
   clientIds?: Record<string, string>; // New: Store client-specific ID values (e.g. { "BPSS ID": "1234" })
   inviteId?: string;
+  referralJoinedRecorded?: boolean;
   recruitedBy?: string;
   recruitedByName?: string;
   duplicateCheck?: DuplicateCheckResult;

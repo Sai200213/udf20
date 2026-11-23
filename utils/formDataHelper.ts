@@ -12,7 +12,7 @@ export const getApplicantName = (
   let fullName: string | null = null;
 
   const nameFieldLabels = {
-    full: ['full name', 'applicant name', 'name'],
+    full: ['full name', 'applicant name', 'employee name'],
     first: ['first name', 'given name'],
     last: ['last name', 'surname', 'family name'],
   };
@@ -20,6 +20,12 @@ export const getApplicantName = (
   for (const section of formSections) {
     for (const field of section.fields) {
       const labelLower = field.label.toLowerCase();
+      // Skip non-applicant names like Father's Name, Mother's Name, Bank Name, Company Name (UDF-AUD-149)
+      if (labelLower.includes('father') || labelLower.includes('mother') || labelLower.includes('parent') ||
+          labelLower.includes('bank') || labelLower.includes('company') || labelLower.includes('reference') ||
+          labelLower.includes('spouse') || labelLower.includes('nominee')) {
+        continue;
+      }
       const value = formData[field.id];
 
       if (typeof value === 'string' && value.trim()) {
@@ -57,6 +63,12 @@ export const getApplicantEmail = (
   for (const section of formSections) {
     for (const field of section.fields) {
       const labelLower = field.label.toLowerCase();
+      // Skip non-applicant names like Father's Name, Mother's Name, Bank Name, Company Name (UDF-AUD-149)
+      if (labelLower.includes('father') || labelLower.includes('mother') || labelLower.includes('parent') ||
+          labelLower.includes('bank') || labelLower.includes('company') || labelLower.includes('reference') ||
+          labelLower.includes('spouse') || labelLower.includes('nominee')) {
+        continue;
+      }
       const value = formData[field.id];
 
       if (typeof value === 'string' && value.trim()) {
@@ -123,12 +135,17 @@ export const getApplicantPAN = (
   for (const section of formSections) {
     for (const field of section.fields || []) {
       const labelLower = field.label.toLowerCase();
-      if (labelLower.includes('pan card') || labelLower.includes('pan no') || labelLower.includes('pan') || labelLower.includes('permanent account number')) {
+      // Exclude company/experience substrings matching 'pan' (UDF-AUD-149)
+      if (labelLower.includes('company') || labelLower.includes('companion') || labelLower.includes('experience')) {
+        continue;
+      }
+      const isPanLabel = /(^|\b)pan(\b|\s*(card|no|number))|permanent account number/i.test(labelLower);
+      if (isPanLabel) {
         const val = formData[field.id];
         if (typeof val === 'string' && val.trim()) {
           const clean = val.trim().toUpperCase().replace(/\s/g, '');
+          if (/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(clean)) return clean;
           if (clean.length === 10) return clean;
-          if (clean.length > 0) return clean;
         }
       }
     }

@@ -71,18 +71,12 @@ const SecuritySettingsModal: React.FC<SecuritySettingsModalProps> = ({
             const { checkEmployeePassword } = await import('../../src/services/employeeService');
             await checkEmployeePassword(employeeId, currentPassword);
 
-            // 2. If changing Google account, unlink the current one now that password is verified
-            if (activeTab === 'change_google') {
-                const { unlinkGoogleAccount } = await import('../../src/services/employeeService');
-                await unlinkGoogleAccount(employeeId, currentPassword);
-            }
-
-            // 3. Open Google popup safely (without replacing core auth session)
+            // 2. Open Google popup safely (without replacing core auth session, UDF-AUD-49)
             const { getGoogleCredentialSafely } = await import('../../src/utils/googleAuthHelper');
             const googleResult = await getGoogleCredentialSafely();
             if (!googleResult.uid || !googleResult.email) throw new Error('Google selection failed.');
 
-            // 4. Link via Cloud Function (completes the actual linking in backend)
+            // 3. Link via Cloud Function (atomically links/updates Google account in backend)
             const { linkGoogleAccount } = await import('../../src/services/employeeService');
             await linkGoogleAccount(employeeId, currentPassword, googleResult.uid, googleResult.email, googleResult.idToken);
 

@@ -9,7 +9,7 @@ export const migrateData = async () => {
 
 export const createInitialAdmin = async (userId: string, email: string, name: string, roleId: string) => {
     try {
-        await setDoc(doc(db, 'staff', userId), {
+        await setDoc(doc(db, 'staff_accounts', userId), {
             username: userId,
             email: email,
             name: name,

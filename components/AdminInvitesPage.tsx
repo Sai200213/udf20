@@ -164,7 +164,15 @@ export const AdminInvitesPage: React.FC<AdminInvitesPageProps> = ({
   const [candidateStatusFilter, setCandidateStatusFilter] = useState('ALL');
 
   // Check Permissions
-  const hasPermission = (p: Permission) => isSuperAdmin || userRole?.permissions.includes(p) || false;
+  const hasPermission = (p: Permission) => {
+    if (isSuperAdmin) return true;
+    if (userRole?.isDisabled === true) return false;
+    const overrides = (authUser as any)?.permissionOverrides;
+    if (overrides && overrides[p] !== undefined) {
+      return Boolean(overrides[p]);
+    }
+    return Boolean(userRole?.permissions?.includes(p));
+  };
   const canManageSettings = hasPermission(Permission.INVITES_MANAGE);
   const canCreateInvites = hasPermission(Permission.INVITES_CREATE);
   const canViewInvites = hasPermission(Permission.INVITES_VIEW);
@@ -219,12 +227,12 @@ export const AdminInvitesPage: React.FC<AdminInvitesPageProps> = ({
     );
 
     if (designationField?.optionsMap) {
-      const mapped = designationField.optionsMap[selectedSite.name];
+      const mapped = designationField.optionsMap[selectedSite.id] || designationField.optionsMap[selectedSite.name];
       if (mapped && mapped.length > 0) {
         return mapped;
       }
     }
-
+ 
     return commonDesignations;
   }, [selectedSiteId, sites, formSections, commonDesignations]);
 
@@ -245,7 +253,7 @@ export const AdminInvitesPage: React.FC<AdminInvitesPageProps> = ({
     );
 
     if (designationField?.optionsMap) {
-      const mapped = designationField.optionsMap[selectedSite.name];
+      const mapped = designationField.optionsMap[selectedSite.id] || designationField.optionsMap[selectedSite.name];
       if (mapped && mapped.length > 0) {
         return mapped;
       }
@@ -324,15 +332,21 @@ export const AdminInvitesPage: React.FC<AdminInvitesPageProps> = ({
     let qEmp;
     let qSub;
     if (isSuperAdmin || hasPermission(Permission.INVITES_VIEW_ALL) || hasPermission(Permission.INVITES_MANAGE)) {
-      // Avoid compound inequality query crashes; query directly and filter in memory
-      qEmp = query(collection(db, 'employees'), limit(50));
-      qSub = query(collection(db, 'onboarding_submissions'), limit(50));
+      // Avoid compound inequality query crashes; query directly and filter in memory (scoped for branch supervisors)
+      if (!isSuperAdmin && sites && sites.length > 0 && sites.length < 24) {
+        const siteIds = sites.map(s => s.id);
+        qEmp = query(collection(db, 'employees'), where('currentSiteId', 'in', siteIds.slice(0, 30)), limit(250));
+        qSub = query(collection(db, 'onboarding_submissions'), where('siteId', 'in', siteIds.slice(0, 30)), limit(250));
+      } else {
+        qEmp = query(collection(db, 'employees'), where('recruitedBy', '!=', null), limit(250));
+        qSub = query(collection(db, 'onboarding_submissions'), where('recruitedBy', '!=', null), limit(250));
+      }
     } else {
       const creatorId = auth.currentUser?.uid || authUser.id;
       const targetRecruiterIds = Array.from(new Set([authUser.id, creatorId, (authUser as any)?.username])).filter(Boolean);
       // Clean equality-only query requiring no composite index
-      qEmp = query(collection(db, 'employees'), where('recruitedBy', 'in', targetRecruiterIds.slice(0, 10)), limit(50));
-      qSub = query(collection(db, 'onboarding_submissions'), where('recruitedBy', 'in', targetRecruiterIds.slice(0, 10)), limit(50));
+      qEmp = query(collection(db, 'employees'), where('recruitedBy', 'in', targetRecruiterIds.slice(0, 10)), limit(250));
+      qSub = query(collection(db, 'onboarding_submissions'), where('recruitedBy', 'in', targetRecruiterIds.slice(0, 10)), limit(250));
     }
 
     let latestEmployees: any[] = [];
@@ -483,7 +497,7 @@ export const AdminInvitesPage: React.FC<AdminInvitesPageProps> = ({
     const inviteId = doc(collection(db, 'referral_invites')).id;
 
     const newInvite: Omit<ReferralInvite, 'id'> = {
-      createdBy: auth.currentUser?.uid || authUser.id,
+      createdBy: authUser.id || auth.currentUser?.uid || 'unknown',
       createdByName: authUser.name || authUser.id,
       createdAt: new Date().toISOString(),
       expiresAt: isReusable ? null : (hasPermission(Permission.INVITES_SET_EXPIRY) ? expiresAt : null),
@@ -591,7 +605,7 @@ export const AdminInvitesPage: React.FC<AdminInvitesPageProps> = ({
       await updateDoc(doc(db, 'referral_invites', inviteToReactivate.id), {
         status: 'Active',
         expiresAt: expiresAt,
-        ...((!inviteToReactivate.isReusable && (inviteToReactivate.joined || 0) >= 1) ? { joined: 0 } : {})
+        ...((!inviteToReactivate.isReusable && (inviteToReactivate.joined || 0) >= 1) ? { isReusable: true } : {})
       });
       await logSystemAction('STATUS_CHANGE', 'INVITES', `Reactivated referral invite link ${inviteToReactivate.id} (${inviteToReactivate.siteName})`);
       setIsReactivateModalOpen(false);
@@ -1218,7 +1232,7 @@ export const AdminInvitesPage: React.FC<AdminInvitesPageProps> = ({
                     // Derive real-time candidate pipeline stats for this invite
                     const inviteCandidates = referredEmployees.filter(c => c.inviteId === invite.id);
                     const pendingCount = inviteCandidates.filter(c => !c.isActive).length;
-                    const activeJoinedCount = inviteCandidates.filter(c => c.isActive).length;
+                    const activeJoinedCount = Math.max(inviteCandidates.filter(c => c.isActive).length, invite.joined || 0);
                     
                     return (
                       <tr key={invite.id} className="hover:bg-slate-50 transition-colors">
@@ -1319,7 +1333,7 @@ export const AdminInvitesPage: React.FC<AdminInvitesPageProps> = ({
                                 <Edit size={14} />
                               </button>
                             )}
-                             {displayStatus === 'Active' && (isSuperAdmin || hasPermission(Permission.INVITES_DELETE)) && (
+                             {displayStatus !== 'Revoked' && (isSuperAdmin || hasPermission(Permission.INVITES_DELETE)) && (
                               <>
                                 {revokingId === invite.id ? (
                                   <div className="flex items-center space-x-1 animate-in slide-in-from-right-2">

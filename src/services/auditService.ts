@@ -10,7 +10,8 @@ import {
     serverTimestamp,
     Timestamp,
     deleteDoc,
-    updateDoc
+    updateDoc,
+    where
 } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 import { AuditLogEntry } from '../../types';
@@ -68,11 +69,19 @@ export const logSystemAction = async (
 };
 
 export const subscribeToAuditLogs = (callback: (logs: AuditLogEntry[]) => void, limitCount = 100, filter?: { actorId?: string }) => {
-    let q = query(
-        collection(db, AUDIT_LOGS_COLLECTION),
-        orderBy('timestamp', 'desc'),
-        limit(limitCount)
-    );
+    // Server-side actor filtering when actorId is specified (UDF-AUD-309)
+    let q = filter?.actorId 
+        ? query(
+            collection(db, AUDIT_LOGS_COLLECTION),
+            where('actorId', '==', filter.actorId),
+            orderBy('timestamp', 'desc'),
+            limit(limitCount)
+          )
+        : query(
+            collection(db, AUDIT_LOGS_COLLECTION),
+            orderBy('timestamp', 'desc'),
+            limit(limitCount)
+          );
 
     return onSnapshot(q, (snapshot) => {
         let logs = snapshot.docs.map(doc => {
@@ -80,8 +89,15 @@ export const subscribeToAuditLogs = (callback: (logs: AuditLogEntry[]) => void, 
             const ts = data.timestamp as Timestamp;
             return {
                 id: doc.id,
+                actionType: data.actionType || data.action || 'LOG',
+                targetModule: data.targetModule || data.module || data.category || 'SYSTEM',
+                details: data.details || data.description || '',
+                targetId: data.targetId || null,
+                actorId: data.actorId || 'system',
+                actorName: data.actorName || data.performedBy || data.actorEmail || 'System',
+                actorRole: data.actorRole || 'Staff',
                 ...data,
-                timestamp: ts ? ts.toDate().toISOString() : new Date().toISOString()
+                timestamp: ts?.toDate ? ts.toDate().toISOString() : (data.timestamp || new Date().toISOString())
             };
         }) as AuditLogEntry[];
 

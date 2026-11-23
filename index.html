@@ -15,7 +15,7 @@
           var targetDomain = 'udfonline.in';
           if (h.indexOf('-admin') !== -1) {
             targetDomain = 'admin.udfonline.in';
-          } else if (h.indexOf('-employee') !== -1) {
+          } else if (h.indexOf('-employee') !== -1 || h.indexOf('-emp') !== -1) {
             targetDomain = 'employee.udfonline.in';
           }
           window.location.replace('https://' + targetDomain + window.location.pathname + window.location.search + window.location.hash);

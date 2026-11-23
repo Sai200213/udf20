@@ -117,11 +117,15 @@ const FieldEditorModal: React.FC<FieldEditorModalProps> = ({ isOpen, onClose, on
       }
     }
 
-    if (existingField) {
-      onSave({ ...existingField, ...fieldData });
-    } else {
-      onSave(fieldData);
-    }
+    const merged = existingField ? { ...existingField, ...fieldData } : fieldData;
+    // Explicitly delete empty/cleared validation constraints to prevent sticky rules (UDF-AUD-99)
+    if (minLength === undefined || minLength === null || minLength === "") delete (merged as any).minLength;
+    if (maxLength === undefined || maxLength === null || maxLength === "") delete (merged as any).maxLength;
+    if (!allowedFileTypes || allowedFileTypes.length === 0) delete (merged as any).allowedFileTypes;
+    if (maxFileSizeMB === undefined || maxFileSizeMB === null || maxFileSizeMB === "") delete (merged as any).maxFileSizeMB;
+    if (minAge === undefined || minAge === null || minAge === "") delete (merged as any).minAge;
+
+    onSave(merged);
     onClose();
   };
 

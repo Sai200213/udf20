@@ -11,17 +11,25 @@ export const sendFirestoreNotification = async (
     link?: string
 ) => {
     try {
-        await addDoc(collection(db, NOTIF_COL), {
-            targetUserId,
-            message,
-            type,
-            link: link || null,
-            read: false,
-            createdAt: serverTimestamp(),
-            timestamp: new Date().toISOString() // Fallback display time
-        });
+        const { httpsCallable } = await import('firebase/functions');
+        const { functions } = await import('../firebase/config');
+        const sendFn = httpsCallable<{ targetUserId: string; message: string; type: string; link?: string | null }, { success: boolean }>(functions, 'sendNotificationServer');
+        await sendFn({ targetUserId, message, type, link: link || null });
     } catch (error) {
-        console.error("Error sending notification:", error);
+        console.error("Error sending notification via server function, attempting client fallback:", error);
+        try {
+            await addDoc(collection(db, NOTIF_COL), {
+                targetUserId,
+                message,
+                type,
+                link: link || null,
+                read: false,
+                createdAt: serverTimestamp(),
+                timestamp: new Date().toISOString()
+            });
+        } catch (clientErr) {
+            console.error("Fallback client notification error:", clientErr);
+        }
     }
 };
 
@@ -36,9 +44,7 @@ export const subscribeToNotifications = (
     // For simplicity, we use "targetUserId" field to store either userId, Portal ID, OR "ROLE:{roleId}".
     // And query `where("targetUserId", "in", targets)`
 
-    const targets = [userId];
-    if (roleId) targets.push(`ROLE:${roleId}`);
-    if (portalId) targets.push(portalId);
+    const targets = Array.from(new Set([userId, roleId ? `ROLE:${roleId}` : '', portalId || ''].filter(Boolean)));
 
     const unsubs: (() => void)[] = [];
     const notifMap = new Map<string, Notification>();
@@ -75,7 +81,7 @@ export const subscribeToNotifications = (
                 }
             });
 
-            const notifs = Array.from(notifMap.values());
+            const notifs = Array.from(notifMap.values()).slice(0, 100);
             notifs.sort((a, b) => {
                 const timeA = new Date(a.timestamp || 0).getTime();
                 const timeB = new Date(b.timestamp || 0).getTime();
@@ -101,11 +107,11 @@ export const markNotificationRead = async (notificationId: string) => {
 };
 
 export const markAllRead = async (userId: string, currentNotifs: Notification[]) => {
-    const batch = writeBatch(db);
-    const unread = currentNotifs.filter(n => !n.read);
+    const unread = currentNotifs.filter(n => !n.read && n.targetUserId === userId).slice(0, 450);
 
     if (unread.length === 0) return;
 
+    const batch = writeBatch(db);
     unread.forEach(n => {
         const ref = doc(db, NOTIF_COL, n.id);
         batch.update(ref, { read: true });

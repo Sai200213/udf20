@@ -37,7 +37,15 @@ const AdminAccountUpdateManagementPage: React.FC<AdminAccountUpdateManagementPag
   const [isLookupLoading, setIsLookupLoading] = useState(false);
 
   const config = workflowConfigs.find(c => c.moduleId === 'ACCOUNT_UPDATES');
-  const hasPermission = (p: Permission) => isSuperAdmin || userRole?.permissions.includes(p) || false;
+  const hasPermission = (p: Permission) => {
+    if (isSuperAdmin) return true;
+    if (userRole?.isDisabled) return false;
+    const userOverrides = (authUser as any)?.permissionOverrides;
+    if (userOverrides && userOverrides[p] !== undefined) {
+      return !!userOverrides[p];
+    }
+    return Boolean(userRole?.permissions?.includes(p));
+  };
 
   const canReview = (req: AccountUpdateRequest) => {
     if (isSuperAdmin) return true; // Override for super admin

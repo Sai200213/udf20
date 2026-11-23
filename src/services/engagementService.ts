@@ -12,9 +12,11 @@ import {
     where, 
     getDocs, 
     orderBy,
+    limit,
     onSnapshot,
     serverTimestamp, 
-    Timestamp 
+    Timestamp,
+    increment 
 } from 'firebase/firestore';
 import log from '../utils/logger';
 
@@ -242,33 +244,17 @@ export const markAttendanceForDate = async (
     idea = ''
 ): Promise<boolean> => {
     try {
-        // Query to check if record exists
-        const q = query(
-            collection(db, 'attendance'),
-            where('userId', '==', userId),
-            where('date', '==', date)
-        );
-        const querySnapshot = await getDocs(q);
-        
-        if (!querySnapshot.empty) {
-            // Update existing
-            const docId = querySnapshot.docs[0].id;
-            await updateDoc(doc(db, 'attendance', docId), {
-                status,
-                idea: idea.trim(),
-                timestamp: serverTimestamp()
-            });
-        } else {
-            // Create new
-            await addDoc(collection(db, 'attendance'), {
-                userId,
-                userName,
-                date,
-                status,
-                idea: idea.trim(),
-                timestamp: serverTimestamp()
-            });
-        }
+        // Deterministic document ID to prevent duplicate attendance on rapid double-taps (UDF-AUD-167)
+        const cleanDocId = `${userId.replace(/\//g, '_')}_${date.replace(/[^0-9-]/g, '')}`;
+        const attRef = doc(db, 'attendance', cleanDocId);
+        await setDoc(attRef, {
+            userId,
+            userName,
+            date,
+            status,
+            idea: idea.trim(),
+            timestamp: serverTimestamp()
+        }, { merge: true });
 
         // Streak check - if marked as 'P' for today, update streak
         const today = getLocalDateString();
@@ -286,6 +272,36 @@ export const markAttendanceForDate = async (
 
 export const markAttendance = async (userId: string, userName: string, idea: string): Promise<boolean> => {
     return markAttendanceForDate(userId, userName, getLocalDateString(), 'P', idea);
+};
+
+/**
+ * Records daily shift attendance points via secure server callable recordDailyStreakServer (UDF-AUD-16 & UDF-AUD-112).
+ * Prevents client-side point manipulation and verifies points have not already been credited today.
+ */
+export const recordAttendancePoints = async (
+    userId: string, 
+    userName: string
+): Promise<{ success: boolean; pointsAdded?: number; alreadyRecorded?: boolean }> => {
+    try {
+        const recordStreakFn = httpsCallable<
+            { userId: string; userName: string; action: string; isAttendanceCheckIn: boolean },
+            { success: boolean; streak: any }
+        >(functions, 'recordDailyStreakServer');
+        const res = await recordStreakFn({ userId, userName, action: 'attendance', isAttendanceCheckIn: true });
+        if (res.data?.streak) {
+            const alreadyRecorded = res.data.streak.alreadyRecordedAttendanceToday === true;
+            log.log(`Server attendance points processed for ${userName}: total pts=${res.data.streak.points}, alreadyRecorded=${alreadyRecorded}`);
+            return {
+                success: true,
+                pointsAdded: alreadyRecorded ? 0 : 5,
+                alreadyRecorded
+            };
+        }
+        return { success: true };
+    } catch (serverErr) {
+        log.error('Server recordDailyStreakServer failed to record attendance points:', serverErr);
+        return { success: false };
+    }
 };
 
 // 3. COMPLAINT & GRIEVANCE SERVICES
@@ -347,7 +363,7 @@ export const submitComplaint = async (
 };
 
 export const subscribeToComplaints = (callback: (complaints: ComplaintItem[]) => void): (() => void) => {
-    const q = query(collection(db, 'complaints'), orderBy('timestamp', 'desc'));
+    const q = query(collection(db, 'complaints'), orderBy('timestamp', 'desc'), limit(200));
     return onSnapshot(q, (snapshot) => {
         const complaints: ComplaintItem[] = snapshot.docs.map(d => ({
             id: d.id,
@@ -414,7 +430,7 @@ export const createRewardRedemption = async (
     rewardTitle: string,
     pointsSpent: number
 ): Promise<boolean> => {
-    // 1. Prefer atomic server-side verification and voucher issuance
+    // 1. Route strictly and atomically through server function (UDF-AUD-273)
     try {
         const redeemFn = httpsCallable<{ userId: string; userName: string; rewardTitle: string; pointsSpent: number }, { success: boolean; voucherCode?: string; remainingPoints?: number }>(functions, 'redeemRewardServer');
         const res = await redeemFn({ userId, userName, rewardTitle, pointsSpent });
@@ -422,45 +438,17 @@ export const createRewardRedemption = async (
             log.log(`Reward redemption created via server for ${userName}: ${rewardTitle} (${pointsSpent} pts, voucher: ${res.data.voucherCode})`);
             return true;
         }
+        return false;
     } catch (serverErr: any) {
-        log.warn('Server redeemRewardServer failed, falling back to local transaction if permitted:', serverErr?.message || serverErr);
-        if (serverErr?.code === 'functions/failed-precondition') {
-            // Insufficient points was strictly rejected by server
-            return false;
-        }
-    }
-
-    try {
-        const streakRef = doc(db, 'user_engagement', userId);
-        const streakSnap = await getDoc(streakRef);
-        const currentPoints = streakSnap.exists() ? (streakSnap.data().points || 0) : 0;
-        
-        if (currentPoints < pointsSpent) {
-            log.warn(`Insufficient points for ${userId}: has ${currentPoints}, needs ${pointsSpent}`);
-            return false;
-        }
-
-        const newPoints = currentPoints - pointsSpent;
-        await setDoc(streakRef, { points: newPoints }, { merge: true });
-
-        await addDoc(collection(db, 'reward_redemptions'), {
-            userId,
-            userName,
-            rewardTitle,
-            pointsSpent,
-            status: 'pending',
-            timestamp: serverTimestamp()
-        });
-        log.log(`Reward redemption created for ${userName}: ${rewardTitle} (${pointsSpent} pts)`);
-        return true;
-    } catch (error) {
-        log.error('Error recording reward redemption:', error);
+        log.error('Server redeemRewardServer failed:', serverErr?.message || serverErr);
+        // UDF-AUD-273: NEVER attempt client-side fallback deduction! Client deduction followed by addDoc fails firestore.rules
+        // and burns employee points with no voucher!
         return false;
     }
 };
 
 export const subscribeToRewardRedemptions = (callback: (redemptions: RewardRedemptionItem[]) => void): (() => void) => {
-    const q = query(collection(db, 'reward_redemptions'), orderBy('timestamp', 'desc'));
+    const q = query(collection(db, 'reward_redemptions'), orderBy('timestamp', 'desc'), limit(200));
     return onSnapshot(q, (snapshot) => {
         const redemptions: RewardRedemptionItem[] = snapshot.docs.map(d => ({
             id: d.id,
@@ -480,6 +468,9 @@ export const updateRewardRedemptionStatus = async (
 ): Promise<boolean> => {
     try {
         const docRef = doc(db, 'reward_redemptions', redemptionId);
+        const existingSnap = await getDoc(docRef);
+        const existingData = existingSnap.exists() ? existingSnap.data() : null;
+
         const updates: any = {
             status,
             updatedAt: serverTimestamp()
@@ -489,6 +480,32 @@ export const updateRewardRedemptionStatus = async (
         if (status === 'fulfilled' || status === 'rejected') {
             updates.fulfilledAt = serverTimestamp();
         }
+
+        // UDF-AUD-41: If redemption is being rejected, refund the spent points back to the user
+        if (status === 'rejected' && existingData && existingData.status !== 'rejected') {
+            const pointsToRefund = Number(existingData.pointsSpent || 0);
+            const targetUserId = existingData.userId || existingData.userUid;
+            if (pointsToRefund > 0 && targetUserId) {
+                const engagementRef = doc(db, 'user_engagement', targetUserId);
+                await updateDoc(engagementRef, {
+                    points: increment(pointsToRefund),
+                    lastUpdated: serverTimestamp()
+                });
+
+                // Audit log the refund in gamification_logs
+                await addDoc(collection(db, 'gamification_logs'), {
+                    userId: targetUserId,
+                    userUid: existingData.userUid || '',
+                    type: 'REWARD_REFUND',
+                    pointsAwarded: pointsToRefund,
+                    description: `Refunded ${pointsToRefund} pts for rejected redemption: ${existingData.rewardTitle || 'Reward'}`,
+                    date: getLocalDateString(),
+                    timestamp: serverTimestamp()
+                });
+                log.log(`[engagementService] Refunded ${pointsToRefund} points to ${targetUserId} for rejected reward.`);
+            }
+        }
+
         await updateDoc(docRef, updates);
         return true;
     } catch (error) {
@@ -513,7 +530,7 @@ export interface ContactInquiryItem {
 }
 
 export const subscribeToContactInquiries = (callback: (inquiries: ContactInquiryItem[]) => void): (() => void) => {
-    const q = query(collection(db, 'contact_messages'), orderBy('timestamp', 'desc'));
+    const q = query(collection(db, 'contact_messages'), orderBy('timestamp', 'desc'), limit(200));
     return onSnapshot(q, (snapshot) => {
         const inquiries: ContactInquiryItem[] = snapshot.docs.map(d => ({
             id: d.id,

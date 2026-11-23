@@ -104,12 +104,14 @@ const DataCorrectionPage: React.FC<DataCorrectionPageProps> = ({ sections }) => 
       const storageKey = `correction_initial_signout_done_${token}`;
       const hasSignedOutAlready = sessionStorage.getItem(storageKey);
       
-      if (!isManager && auth.currentUser && !hasSignedOutAlready) {
-        console.log("Forcing initial sign out of stale session on correction page mount");
-        sessionStorage.setItem(storageKey, 'true');
-        await auth.signOut();
-        setCurrentUser(null);
-      }
+      const isEmployeeOrAdmin = authUser && (
+        isManager ||
+        authUser.type === 'Employee' ||
+        (requestDoc?.targetId && (authUser.id === requestDoc.targetId || (authUser as any).employeeId === requestDoc.targetId))
+      );
+
+      // UDF-AUD-200: Do not forcefully sign out the active user on page mount;
+      // allow authenticated employees/candidates to proceed directly without session tearing
       setInitialSignOutDone(true);
     };
 
@@ -145,7 +147,7 @@ const DataCorrectionPage: React.FC<DataCorrectionPageProps> = ({ sections }) => 
   }, [sections, targetData, requestDoc]);
 
   // 2. Fetch correction request details and targets
-  const loadCorrectionDetails = useCallback(async () => {
+  const loadCorrectionDetails = useCallback(async (isPostVerify: boolean = false) => {
     if (!token) {
       setError("No token provided. Please use the complete link sent to you by HR.");
       setLoading(false);
@@ -161,14 +163,15 @@ const DataCorrectionPage: React.FC<DataCorrectionPageProps> = ({ sections }) => 
       // Ensure at least anonymous auth is active for Firebase rules
       await ensureAuthenticated();
 
-      let request = await getCorrectionRequest(token);
+      let request: any = null;
+      try {
+        const challenge = await getCorrectionChallengeClient(token);
+        if (challenge && challenge.request) {
+          request = challenge.request;
+        }
+      } catch (_) {}
       if (!request) {
-        try {
-          const challenge = await getCorrectionChallengeClient(token);
-          if (challenge && challenge.request) {
-            request = challenge.request;
-          }
-        } catch (_) {}
+        request = await getCorrectionRequest(token).catch(() => null);
       }
       if (!request) {
         setError("Invalid correction link. This link does not exist.");
@@ -190,32 +193,34 @@ const DataCorrectionPage: React.FC<DataCorrectionPageProps> = ({ sections }) => 
         return;
       }
 
-      // Fetch target data (Employee or Submission)
+      // Fetch target data (Employee or Submission) ONLY if already verified or authorized
       let data: any = null;
-      try {
-        const targetCollection = request.targetType === 'employee' ? 'employees' : 'onboarding_submissions';
-        let targetRef = doc(db, targetCollection, request.targetId);
-        let targetSnap = await getDoc(targetRef);
+      if (isPostVerify || guestVerified || (auth.currentUser && !auth.currentUser.isAnonymous)) {
+        try {
+          const targetCollection = request.targetType === 'employee' ? 'employees' : 'onboarding_submissions';
+          let targetRef = doc(db, targetCollection, request.targetId);
+          let targetSnap = await getDoc(targetRef);
 
-        // Fallback for older tokens where targetId was set to employeeId (e.g. HY140000) instead of docId
-        if (!targetSnap.exists() && request.targetType === 'employee') {
-          try {
-            const q = query(collection(db, 'employees'), where("employeeId", "==", request.targetId), limit(1));
-            const qSnap = await getDocs(q);
-            if (!qSnap.empty) {
-              targetSnap = qSnap.docs[0] as any;
+          // Fallback for older tokens where targetId was set to employeeId (e.g. HY140000) instead of docId
+          if (!targetSnap.exists() && request.targetType === 'employee') {
+            try {
+              const q = query(collection(db, 'employees'), where("employeeId", "==", request.targetId), limit(1));
+              const qSnap = await getDocs(q);
+              if (!qSnap.empty) {
+                targetSnap = qSnap.docs[0] as any;
+              }
+            } catch (qErr) {
+              // Unauthenticated users may not list/query; fallback handled gracefully
             }
-          } catch (qErr) {
-            // Unauthenticated users may not list/query; fallback handled gracefully
           }
-        }
 
-        if (targetSnap.exists()) {
-          data = targetSnap.data();
-          setTargetData(data);
+          if (targetSnap.exists()) {
+            data = targetSnap.data();
+            setTargetData(data);
+          }
+        } catch (readErr) {
+          console.warn("[DataCorrectionPage] Direct target read restricted by security rules pending authentication:", readErr);
         }
-      } catch (readErr) {
-        console.warn("[DataCorrectionPage] Direct target read restricted by security rules pending authentication:", readErr);
       }
 
       // Determine verification & login routing directly from request doc or target data
@@ -340,6 +345,7 @@ const DataCorrectionPage: React.FC<DataCorrectionPageProps> = ({ sections }) => 
           }
           await ensureAuthenticated();
           setGuestVerified(true);
+          await loadCorrectionDetails(true);
           setVerifyingGuest(false);
           return;
         }
@@ -394,7 +400,8 @@ const DataCorrectionPage: React.FC<DataCorrectionPageProps> = ({ sections }) => 
     if (field.type === FieldType.CHECKBOX) {
       isEmpty = !value || (Array.isArray(value) && value.length === 0);
     } else if (field.type === FieldType.FILE_UPLOAD) {
-      isEmpty = !value || (typeof value === 'string' && value.trim() === '');
+      const pathVal = typeof value === 'object' && value !== null ? (value.storagePath || value.url || value.fileUrl || '') : value;
+      isEmpty = !pathVal || (typeof pathVal === 'string' && pathVal.trim() === '');
     } else {
       isEmpty = value === undefined || value === null || String(value).trim() === '';
     }
@@ -643,7 +650,7 @@ const DataCorrectionPage: React.FC<DataCorrectionPageProps> = ({ sections }) => 
           return "Only JPG, PNG, WEBP images and PDF documents are allowed.";
         }
         const fileSizeMB = value.size / (1024 * 1024);
-        if (fileSizeMB > maxMB && !isImage) {
+        if (fileSizeMB > maxMB) {
           return `File size must be less than ${maxMB}MB.`;
         }
       }
@@ -720,6 +727,19 @@ const DataCorrectionPage: React.FC<DataCorrectionPageProps> = ({ sections }) => 
       // Scroll to first error
       const firstErrorId = Object.keys(errors)[0];
       document.getElementById(firstErrorId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
+    // Check if at least one field was actually updated
+    const originalFields = requestDoc.requestedFieldValues || targetData?.formData || targetData?.profileData || targetData?.data || {};
+    const hasAnyChange = requestDoc.requestedFields.some(fieldId => {
+      const orig = originalFields[fieldId] ?? '';
+      const curr = formData[fieldId] ?? '';
+      return JSON.stringify(orig) !== JSON.stringify(curr);
+    });
+
+    if (!hasAnyChange) {
+      alert("No changes detected. Please update the requested information before submitting your corrections.");
       return;
     }
 

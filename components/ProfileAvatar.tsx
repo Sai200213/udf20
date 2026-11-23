@@ -2,7 +2,7 @@
 import React, { useState, useRef } from 'react';
 import { Camera, Loader2, UserCircle, X } from 'lucide-react';
 import { uploadProfilePhoto, getSecureURL } from '../src/services/storageService';
-import { doc, updateDoc } from 'firebase/firestore';
+import { doc, updateDoc, getDoc, setDoc, query, where, collection as fsCollection, getDocs } from 'firebase/firestore';
 import { db } from '../src/firebase/config';
 
 interface ProfileAvatarProps {
@@ -30,6 +30,12 @@ const ProfileAvatar: React.FC<ProfileAvatarProps> = ({
     const [isUploading, setIsUploading] = useState(false);
     const [showPreview, setShowPreview] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const inputId = React.useId();
+    const uploadInputId = `avatar-upload-${userId}-${inputId}`;
+
+    React.useEffect(() => {
+        setPhotoURL(currentPhotoURL);
+    }, [currentPhotoURL]);
 
     React.useEffect(() => {
         let isMounted = true;
@@ -78,11 +84,11 @@ const ProfileAvatar: React.FC<ProfileAvatarProps> = ({
 
         setIsUploading(true);
         try {
-            const downloadURL = await uploadProfilePhoto(userId, file);
+            const targetCollection = (collection === 'staffUsers' || collection === 'staff') ? 'staff_accounts' : collection;
+            const downloadURL = await uploadProfilePhoto(userId, file, targetCollection === 'staff_accounts' ? 'staff_accounts' : 'employees');
             setPhotoURL(downloadURL);
 
-            // Update Firestore
-            const targetCollection = collection === 'staffUsers' ? 'staff_accounts' : collection;
+            // Update Firestore (UDF-AUD-15, UDF-AUD-116)
             if (targetCollection === 'employees') {
                 const { resolveEmployeeDoc } = await import('../src/services/employeeService');
                 const resolved = await resolveEmployeeDoc(userId);
@@ -90,6 +96,34 @@ const ProfileAvatar: React.FC<ProfileAvatarProps> = ({
                 await updateDoc(targetRef, {
                     profilePhotoURL: downloadURL
                 });
+
+                // Also sync to onboarding_submissions if submissionId or record exists (UDF-AUD-116)
+                try {
+                    const empData = resolved?.data as any;
+                    const subId = empData?.submissionId || resolved?.ref?.id || userId;
+                    if (subId) {
+                        const subRef = doc(db, 'onboarding_submissions', subId);
+                        const subSnap = await getDoc(subRef);
+                        if (subSnap.exists()) {
+                            await updateDoc(subRef, { profilePhotoURL: downloadURL });
+                        }
+                    }
+                } catch (subErr) {
+                    console.warn('[ProfileAvatar] Failed to sync photo to onboarding_submissions:', subErr);
+                }
+            } else if (targetCollection === 'staff_accounts') {
+                const targetRef = doc(db, 'staff_accounts', userId);
+                const snap = await getDoc(targetRef);
+                if (snap.exists()) {
+                    await updateDoc(targetRef, { profilePhotoURL: downloadURL });
+                } else {
+                    const qSnap = await getDocs(query(fsCollection(db, 'staff_accounts'), where('email', '==', userId)));
+                    if (!qSnap.empty) {
+                        await updateDoc(qSnap.docs[0].ref, { profilePhotoURL: downloadURL });
+                    } else {
+                        await setDoc(targetRef, { profilePhotoURL: downloadURL }, { merge: true });
+                    }
+                }
             } else {
                 await updateDoc(doc(db, targetCollection, userId), {
                     profilePhotoURL: downloadURL
@@ -168,7 +202,7 @@ const ProfileAvatar: React.FC<ProfileAvatarProps> = ({
                 {/* Upload Overlay (only when editable) */}
                 {editable && (
                     <label
-                        htmlFor={`avatar-upload-${userId}`}
+                        htmlFor={uploadInputId}
                         style={{
                             position: 'absolute',
                             bottom: 0,
@@ -197,7 +231,7 @@ const ProfileAvatar: React.FC<ProfileAvatarProps> = ({
 
                 <input
                     ref={fileInputRef}
-                    id={`avatar-upload-${userId}`}
+                    id={uploadInputId}
                     type="file"
                     accept="image/*"
                     onChange={handleFileSelect}

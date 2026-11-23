@@ -23,10 +23,10 @@ const PublicFooter: React.FC = () => {
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
                     {/* Brand column */}
                     <div className="space-y-4">
-                        <div className="flex items-center space-x-3 text-white font-bold text-lg">
+                        <a href="/" onClick={(e) => { e.preventDefault(); navigate('/'); }} className="flex items-center space-x-3 text-white font-bold text-lg">
                             <img src="/logo.png" alt="Logo" className="h-8 w-auto" />
                             <span>Unique Delta Force</span>
-                        </div>
+                        </a>
                         <p className="text-xs leading-relaxed text-slate-400">
                             A leading provider of enterprise security guards, smart CCTV monitoring, and protective services for commercial, industrial, and software facilities.
                         </p>
@@ -37,16 +37,16 @@ const PublicFooter: React.FC = () => {
                         <h3 className="text-white text-sm font-bold uppercase tracking-wider mb-4">Quick Links</h3>
                         <ul className="space-y-2 text-xs">
                             <li>
-                                <span onClick={() => navigate('/')} className="hover:text-blue-400 transition-colors cursor-pointer">Home</span>
+                                <a href="/" onClick={(e) => { e.preventDefault(); navigate('/'); }} className="hover:text-blue-400 transition-colors">Home</a>
                             </li>
                             <li>
-                                <span onClick={() => navigate('/blogs')} className="hover:text-blue-400 transition-colors cursor-pointer">Blogs & Guides</span>
+                                <a href="/blogs" onClick={(e) => { e.preventDefault(); navigate('/blogs'); }} className="hover:text-blue-400 transition-colors">Blogs & Guides</a>
                             </li>
                             <li>
-                                <span onClick={() => navigate('/careers')} className="hover:text-blue-400 transition-colors cursor-pointer">Careers & Vacancies</span>
+                                <a href="/careers" onClick={(e) => { e.preventDefault(); navigate('/careers'); }} className="hover:text-blue-400 transition-colors">Careers & Vacancies</a>
                             </li>
                             <li>
-                                <span onClick={() => navigate('/contact')} className="hover:text-blue-400 transition-colors cursor-pointer">Contact Us</span>
+                                <a href="/contact" onClick={(e) => { e.preventDefault(); navigate('/contact'); }} className="hover:text-blue-400 transition-colors">Contact Us</a>
                             </li>
                         </ul>
                     </div>
@@ -56,13 +56,13 @@ const PublicFooter: React.FC = () => {
                         <h3 className="text-white text-sm font-bold uppercase tracking-wider mb-4">Legal & Trust</h3>
                         <ul className="space-y-2 text-xs">
                             <li>
-                                <span onClick={() => navigate('/privacy-policy')} className="hover:text-blue-400 transition-colors cursor-pointer">Privacy Policy</span>
+                                <a href="/privacy-policy" onClick={(e) => { e.preventDefault(); navigate('/privacy-policy'); }} className="hover:text-blue-400 transition-colors">Privacy Policy</a>
                             </li>
                             <li>
-                                <span onClick={() => navigate('/terms-of-service')} className="hover:text-blue-400 transition-colors cursor-pointer">Terms of Service</span>
+                                <a href="/terms-of-service" onClick={(e) => { e.preventDefault(); navigate('/terms-of-service'); }} className="hover:text-blue-400 transition-colors">Terms of Service</a>
                             </li>
                             <li>
-                                <span onClick={() => navigate('/contact')} className="hover:text-blue-400 transition-colors cursor-pointer">Help & Support</span>
+                                <a href="/contact" onClick={(e) => { e.preventDefault(); navigate('/contact'); }} className="hover:text-blue-400 transition-colors">Help & Support</a>
                             </li>
                         </ul>
                     </div>
@@ -85,14 +85,12 @@ const PublicFooter: React.FC = () => {
                                     <span>{webConfig?.contactEmail || "info@udfonline.in"}</span>
                                 </li>
                             </ul>
-                            <a
-                                href="https://forms.gle/f86UXjTiusatMUVd7"
-                                target="_blank"
-                                rel="noopener noreferrer"
+                            <button
+                                onClick={() => navigate('/join')}
                                 className="inline-block bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold py-2.5 px-5 rounded-xl transition-all shadow-sm text-center"
                             >
                                 Join UDF (Apply Online)
-                            </a>
+                            </button>
                         </div>
                     ) : (
                         <div>
@@ -107,14 +105,12 @@ const PublicFooter: React.FC = () => {
                                 >
                                     Contact Our Team
                                 </button>
-                                <a
-                                    href="https://forms.gle/f86UXjTiusatMUVd7"
-                                    target="_blank"
-                                    rel="noopener noreferrer"
+                                <button
+                                    onClick={() => navigate('/join')}
                                     className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold py-2.5 px-5 rounded-xl transition-all shadow-sm text-center block"
                                 >
                                     Join UDF (Apply Online)
-                                </a>
+                                </button>
                             </div>
                         </div>
                     )}

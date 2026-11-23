@@ -92,30 +92,48 @@ const DEFAULT_CONFIG: WebsiteServiceData = {
     ]
 };
 
-export const getWebsiteConfig = async (): Promise<WebsiteServiceData> => {
+let cachedWebsiteConfig: WebsiteServiceData | null = null;
+let cachedConfigTimestamp = 0;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes cache
+
+export const getWebsiteConfig = async (forceRefresh = false): Promise<WebsiteServiceData> => {
+    if (!forceRefresh && cachedWebsiteConfig && (Date.now() - cachedConfigTimestamp < CACHE_TTL_MS)) {
+        return cachedWebsiteConfig;
+    }
     try {
         const docRef = doc(db, 'settings', 'public_website');
         const snap = await getDoc(docRef);
         if (snap.exists()) {
             const data = snap.data() as WebsiteServiceData;
-            return {
+            const config: WebsiteServiceData = {
                 ...DEFAULT_CONFIG,
                 ...data,
                 // Ensure array fields are not undefined
                 services: data.services || DEFAULT_CONFIG.services,
                 careersBenefits: data.careersBenefits || DEFAULT_CONFIG.careersBenefits
             };
+            cachedWebsiteConfig = config;
+            cachedConfigTimestamp = Date.now();
+            return config;
         } else {
+            cachedWebsiteConfig = DEFAULT_CONFIG;
+            cachedConfigTimestamp = Date.now();
             return DEFAULT_CONFIG;
         }
     } catch (err) {
         console.error('Error fetching website config:', err);
-        return DEFAULT_CONFIG;
+        return cachedWebsiteConfig || DEFAULT_CONFIG;
     }
 };
 
 export const updateWebsiteConfig = async (config: WebsiteServiceData): Promise<void> => {
     const docRef = doc(db, 'settings', 'public_website');
-    await setDoc(docRef, config);
+    // Strip undefined values to prevent Firestore serialization crashes and merge safely (UDF-AUD-405)
+    const cleanConfig = Object.fromEntries(
+        Object.entries(config).filter(([_, v]) => v !== undefined)
+    );
+    await setDoc(docRef, cleanConfig, { merge: true });
+    cachedWebsiteConfig = { ...cachedWebsiteConfig, ...config };
+    cachedConfigTimestamp = Date.now();
     await logSystemAction('UPDATE', 'SETTINGS', 'Updated public website CMS configuration & contact settings');
 };

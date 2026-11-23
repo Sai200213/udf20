@@ -20,9 +20,9 @@ import PublicHeader from './common/PublicHeader';
 import PublicFooter from './common/PublicFooter';
 import AdSenseUnit from './common/AdSenseUnit';
 import AttendanceCalendar from './employee/AttendanceCalendar';
-import { getUserStreak, updateOrCreateStreak, submitComplaint, createRewardRedemption, UserStreak } from '../src/services/engagementService';
+import { getUserStreak, updateOrCreateStreak, submitComplaint, createRewardRedemption, UserStreak, getLocalDateString } from '../src/services/engagementService';
 import { db, functions } from '../src/firebase/config';
-import { doc, setDoc, getDoc, collection, getDocs } from 'firebase/firestore';
+import { doc, setDoc, getDoc, collection, getDocs, query, orderBy } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
 
 const BlogDashboardPage: React.FC = () => {
@@ -102,12 +102,12 @@ const BlogDashboardPage: React.FC = () => {
                 });
             }
 
-            // 2. Fetch custom quizzes
-            const quizzesSnap = await getDocs(collection(db, 'safety_quizzes'));
+            // 2. Fetch custom quizzes (synchronized with Employee Engagement Hub via deterministic epoch day index - UDF-AUD-113)
+            const quizzesSnap = await getDocs(query(collection(db, 'safety_quizzes'), orderBy('createdAt', 'desc')));
             if (!quizzesSnap.empty) {
                 const list = quizzesSnap.docs.map(doc => ({ id: doc.id, ...doc.data() as any }));
-                // Pick a daily question based on the day of the month
-                const dayIndex = new Date().getDate() % list.length;
+                // Pick a daily question based on epoch days matching Employee Engagement Hub
+                const dayIndex = Math.floor(Date.now() / (1000 * 60 * 60 * 24)) % list.length;
                 const activeQuiz = list[dayIndex];
                 setQuizQuestion({
                     id: activeQuiz.id,
@@ -133,6 +133,14 @@ const BlogDashboardPage: React.FC = () => {
             if (userStreak) {
                 setStreak(userStreak);
                 setPoints(userStreak.points || 0);
+                const today = getLocalDateString();
+                if (userStreak.lastQuizDate === today) {
+                    setQuizSubmitted(true);
+                    setQuizAwarded(true);
+                    if (userStreak.lastQuizOption) {
+                        setQuizAnswer(userStreak.lastQuizOption);
+                    }
+                }
             }
         } catch (err) {
             console.error("Failed to load/update streak and points:", err);
@@ -141,17 +149,22 @@ const BlogDashboardPage: React.FC = () => {
         }
     };
 
-    // Calculate payday countdown
+    // Calculate payday countdown (UDF-AUD-155)
     const daysUntilPayday = useMemo(() => {
-        const today = new Date();
-        const year = today.getFullYear();
-        const month = today.getMonth();
-        let payday = new Date(year, month, 7);
-        if (today.getDate() > 7) {
-            payday = new Date(year, month + 1, 7);
+        const now = new Date();
+        const todayDate = now.getDate();
+        if (todayDate === 7) return 0; // Today is Payday!
+
+        const year = now.getFullYear();
+        const month = now.getMonth();
+        let targetPayday = new Date(year, month, 7, 23, 59, 59);
+        if (todayDate > 7) {
+            targetPayday = new Date(year, month + 1, 7, 23, 59, 59);
         }
-        const diffTime = payday.getTime() - today.getTime();
-        return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        const todayMidnight = new Date(year, month, todayDate);
+        const targetMidnight = new Date(targetPayday.getFullYear(), targetPayday.getMonth(), 7);
+        const diffTime = targetMidnight.getTime() - todayMidnight.getTime();
+        return Math.max(0, Math.round(diffTime / (1000 * 60 * 60 * 24)));
     }, []);
 
     // Handle safety quiz submission
@@ -167,7 +180,7 @@ const BlogDashboardPage: React.FC = () => {
                     questionId: (quizQuestion as any).id || undefined,
                     selectedAnswer: quizAnswer,
                     targetUserId: userId,
-                    quizDate: new Date().toISOString().split('T')[0]
+                    quizDate: getLocalDateString()
                 });
                 if (res.data?.isCorrect) {
                     const earned = res.data.pointsEarned ?? gamificationRules.quizPoints;
@@ -191,7 +204,9 @@ const BlogDashboardPage: React.FC = () => {
         setSubmittingComplaint(true);
         setComplaintStatus('idle');
         try {
-            const success = await submitComplaint(userId, userName, complaintText);
+            const userSiteId = (user as any)?.currentSiteId || (user as any)?.siteId || '';
+            const userSiteName = (user as any)?.siteName || '';
+            const success = await submitComplaint(userId, userName, complaintText, 'normal', userSiteId, userSiteName);
             if (success) {
                 setComplaintStatus('success');
                 setComplaintText('');

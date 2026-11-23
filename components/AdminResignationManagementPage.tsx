@@ -1,5 +1,5 @@
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { ResignationRequest, RequestStatus, Role, WorkflowConfig, Permission, Site, SubmittedFormData, User } from '../types';
 import Button from './common/Button';
 import Modal from './common/Modal';
@@ -10,6 +10,7 @@ import { getEmployeeLookupMap } from '../src/services/employeeService';
 import { getEffectiveApprovalLevel, isRoleAssignedToSite } from '../src/utils/workflowHelper';
 import { useData } from '../src/contexts/DataContext';
 import SecureDocumentLink from '../src/components/common/SecureDocumentLink';
+import { fetchResignationRequestsByStatus } from '../src/services/requestService';
 
 interface AdminResignationManagementPageProps {
   resignationRequests: ResignationRequest[];
@@ -37,11 +38,26 @@ const AdminResignationManagementPage: React.FC<AdminResignationManagementPagePro
   const [revertTargetLevel, setRevertTargetLevel] = useState(1);
   const [filterStatus, setFilterStatus] = useState<RequestStatus | 'ALL'>('ALL');
   const [isLookupLoading, setIsLookupLoading] = useState(false);
+  const [historicalRequests, setHistoricalRequests] = useState<ResignationRequest[]>([]);
+  const [isLoadingHistorical, setIsLoadingHistorical] = useState(false);
+  const [isProcessingAction, setIsProcessingAction] = useState(false);
 
   const config = workflowConfigs.find(c => c.moduleId === 'RESIGNATIONS');
 
-  const hasManagePerm = isSuperAdmin || userRole?.permissions.includes(Permission.MANAGE_RESIGNATIONS);
-  const hasPermission = (p: Permission) => isSuperAdmin || userRole?.permissions.includes(p) || false;
+  const hasManagePerm = isSuperAdmin || 
+    (!userRole?.isDisabled && (
+      Boolean(userRole?.permissions?.includes(Permission.MANAGE_RESIGNATIONS)) ||
+      Boolean(userRole?.permissions?.includes(Permission.RESIGNATIONS_APPROVE))
+    ));
+  const hasPermission = (p: Permission) => {
+    if (isSuperAdmin) return true;
+    if (userRole?.isDisabled) return false;
+    const userOverrides = (authUser as any)?.permissionOverrides;
+    if (userOverrides && userOverrides[p] !== undefined) {
+      return !!userOverrides[p];
+    }
+    return Boolean(userRole?.permissions?.includes(p));
+  };
 
   const canReview = (req: ResignationRequest) => {
     if (isSuperAdmin) return true; // Override for super admin
@@ -54,6 +70,19 @@ const AdminResignationManagementPage: React.FC<AdminResignationManagementPagePro
     const currentLevelConfig = config?.levels.find(l => l.level === effectiveLevel);
     return currentLevelConfig?.roleId === userRole?.id;
   };
+
+  // Fetch historical data on-demand when filter changes to Approved/Rejected or ALL (UDF-AUD-132, UDF-AUD-174)
+  useEffect(() => {
+    if (filterStatus === RequestStatus.APPROVED || filterStatus === RequestStatus.REJECTED || filterStatus === 'ALL') {
+      setIsLoadingHistorical(true);
+      fetchResignationRequestsByStatus(filterStatus, allowedSiteIds, 200)
+        .then(data => setHistoricalRequests(data))
+        .catch(err => console.error('Failed to fetch historical resignation data:', err))
+        .finally(() => setIsLoadingHistorical(false));
+    } else {
+      setHistoricalRequests([]);
+    }
+  }, [filterStatus, allowedSiteIds]);
 
   const openDetailsModal = (request: ResignationRequest) => {
     setSelectedRequest(request);
@@ -69,36 +98,47 @@ const AdminResignationManagementPage: React.FC<AdminResignationManagementPagePro
     setEditedRelievingDate('');
   };
 
-  // Load employee lookup for site filtering - REMOVED since filtering is now centralized in DataContext
+  const allCombinedRequests = useMemo(() => {
+    const map = new Map<string, ResignationRequest>();
+    (resignationRequests || []).forEach(r => map.set(r.id, r));
+    (historicalRequests || []).forEach(r => map.set(r.id, r));
+    return Array.from(map.values());
+  }, [resignationRequests, historicalRequests]);
 
   const filteredRequests = useMemo(() => {
-    return resignationRequests.filter(req => {
+    const baseList = filterStatus === RequestStatus.PENDING ? resignationRequests : allCombinedRequests;
+    return baseList.filter(req => {
       const matchesStatus = filterStatus === 'ALL' || req.status === filterStatus;
       return matchesStatus;
     }).sort((a, b) => new Date(b.submissionDate).getTime() - new Date(a.submissionDate).getTime());
-  }, [resignationRequests, filterStatus]);
+  }, [resignationRequests, allCombinedRequests, filterStatus]);
 
   return (
     <div className="p-0">
       <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
         <div className="flex gap-2">
-          {['ALL', RequestStatus.PENDING, RequestStatus.APPROVED, RequestStatus.REJECTED].map(s => (
-            <Button
-              key={s}
-              variant={filterStatus === s ? 'primary' : 'secondary'}
-              size="sm"
-              onClick={() => setFilterStatus(s as any)}
-            >
-              {s === 'ALL' ? 'Total' : s} ({s === 'ALL' ? resignationRequests.length : resignationRequests.filter(r => r.status === s).length})
-            </Button>
-          ))}
+          {['ALL', RequestStatus.PENDING, RequestStatus.APPROVED, RequestStatus.REJECTED].map(s => {
+            const count = s === 'ALL' 
+              ? allCombinedRequests.length 
+              : allCombinedRequests.filter(r => r.status === s).length;
+            return (
+              <Button
+                key={s}
+                variant={filterStatus === s ? 'primary' : 'secondary'}
+                size="sm"
+                onClick={() => setFilterStatus(s as any)}
+              >
+                {s === 'ALL' ? 'Total' : s} ({count})
+              </Button>
+            );
+          })}
         </div>
         {!hasManagePerm && !isSuperAdmin && (
           <div className="bg-green-50 border border-green-200 text-green-700 px-3 py-1.5 rounded-md text-xs font-bold flex items-center">
             <Info size={14} className="mr-2" /> READ-ONLY VIEWER
           </div>
         )}
-        {userRole?.name.toLowerCase().includes('field officer') && (
+        {!isSuperAdmin && !hasPermission(Permission.RESIGNATIONS_VIEW_SCOPE_ALL) && (
           <div className="bg-blue-50 border border-blue-200 text-blue-700 px-3 py-1.5 rounded-md text-xs font-bold flex items-center">
             <Shield size={14} className="mr-2" /> Showing Assigned Sites Only
           </div>
@@ -213,7 +253,7 @@ const AdminResignationManagementPage: React.FC<AdminResignationManagementPagePro
                   </span>
                 </div>
                 <SecureDocumentLink
-                  path={typeof selectedRequest.document === 'string' ? selectedRequest.document : (selectedRequest.document as any).url}
+                  path={typeof selectedRequest.document === 'string' ? selectedRequest.document : ((selectedRequest.document as any).storagePath || (selectedRequest.document as any).url || '')}
                   className="text-sm font-semibold text-blue-600 hover:text-blue-800 underline"
                 >
                   View Document
@@ -296,16 +336,22 @@ const AdminResignationManagementPage: React.FC<AdminResignationManagementPagePro
                             <Button
                               variant="secondary"
                               size="sm"
-                              onClick={() => {
+                              disabled={isProcessingAction}
+                              onClick={async () => {
                                 const target = isSuperAdmin ? revertTargetLevel : effectiveLevel - 1;
                                 if (window.confirm(`Revert to Level ${target}?`)) {
-                                  onRevert?.(selectedRequest.id, target);
-                                  closeDetailsModal();
+                                  setIsProcessingAction(true);
+                                  try {
+                                    await onRevert?.(selectedRequest.id, target);
+                                    closeDetailsModal();
+                                  } finally {
+                                    setIsProcessingAction(false);
+                                  }
                                 }
                               }}
                               className="bg-amber-100 text-amber-700"
                             >
-                              {isSuperAdmin ? 'Revert' : 'Revert One Step'}
+                              {isProcessingAction ? 'Reverting...' : (isSuperAdmin ? 'Revert' : 'Revert One Step')}
                             </Button>
                           )}
                         </div>
@@ -314,8 +360,20 @@ const AdminResignationManagementPage: React.FC<AdminResignationManagementPagePro
                   })()}
                   <div className="flex justify-end space-x-2">
                     {hasPermission(Permission.RESIGNATIONS_REJECT) && (
-                      <Button variant="danger" onClick={() => { onAction(selectedRequest.id, RequestStatus.REJECTED, adminComments, editedRelievingDate); closeDetailsModal(); }}>
-                        <XCircle size={18} className="mr-1" /> Reject
+                      <Button 
+                        variant="danger" 
+                        disabled={isProcessingAction}
+                        onClick={async () => { 
+                          setIsProcessingAction(true);
+                          try {
+                            await onAction(selectedRequest.id, RequestStatus.REJECTED, adminComments, editedRelievingDate); 
+                            closeDetailsModal(); 
+                          } finally {
+                            setIsProcessingAction(false);
+                          }
+                        }}
+                      >
+                        <XCircle size={18} className="mr-1" /> {isProcessingAction ? 'Processing...' : 'Reject'}
                       </Button>
                     )}
                     {(() => {
@@ -328,23 +386,38 @@ const AdminResignationManagementPage: React.FC<AdminResignationManagementPagePro
                         <div className="flex gap-2">
                           <Button 
                             variant="primary" 
-                            onClick={() => { onAction(selectedRequest.id, RequestStatus.APPROVED, adminComments, editedRelievingDate, false); closeDetailsModal(); }} 
+                            disabled={isProcessingAction}
+                            onClick={async () => { 
+                              setIsProcessingAction(true);
+                              try {
+                                await onAction(selectedRequest.id, RequestStatus.APPROVED, adminComments, editedRelievingDate, false); 
+                                closeDetailsModal(); 
+                              } finally {
+                                setIsProcessingAction(false);
+                              }
+                            }} 
                             className="bg-green-600 hover:bg-green-700"
                           >
-                            <CheckCircle size={18} className="mr-1" /> {hasMoreLevels ? `Approve Level ${effectiveLevel}` : 'Final Approval'}
+                            <CheckCircle size={18} className="mr-1" /> {isProcessingAction ? 'Processing...' : (hasMoreLevels ? `Approve Level ${effectiveLevel}` : 'Final Approval')}
                           </Button>
                           {isSuperAdmin && hasMoreLevels && (
                             <Button 
                               variant="primary" 
-                              onClick={() => { 
+                              disabled={isProcessingAction}
+                              onClick={async () => { 
                                 if (window.confirm("Bypass remaining levels and grant Direct Final Approval?")) {
-                                  onAction(selectedRequest.id, RequestStatus.APPROVED, adminComments, editedRelievingDate, true); 
-                                  closeDetailsModal(); 
+                                  setIsProcessingAction(true);
+                                  try {
+                                    await onAction(selectedRequest.id, RequestStatus.APPROVED, adminComments, editedRelievingDate, true); 
+                                    closeDetailsModal(); 
+                                  } finally {
+                                    setIsProcessingAction(false);
+                                  }
                                 }
                               }} 
                               className="bg-emerald-700 hover:bg-emerald-800 font-semibold"
                             >
-                              Direct Final Approval
+                              {isProcessingAction ? 'Processing...' : 'Direct Final Approval'}
                             </Button>
                           )}
                         </div>

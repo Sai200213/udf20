@@ -8,6 +8,8 @@ import {
   updateDoc, 
   query, 
   where,
+  orderBy,
+  limit,
   getDocs,
   onSnapshot
 } from 'firebase/firestore';
@@ -22,8 +24,11 @@ const BGV_COLLECTION = 'bgv_records';
 /**
  * Subscribe in real time to all BGV records.
  */
-export const subscribeToBgvRecords = (callback: (records: BgvRecord[]) => void) => {
-  const q = query(collection(db, BGV_COLLECTION));
+export const subscribeToBgvRecords = (callback: (records: BgvRecord[]) => void, allowedSiteIds?: string[]) => {
+  let q = query(collection(db, BGV_COLLECTION), orderBy('initiatedDate', 'desc'), limit(500));
+  if (allowedSiteIds && allowedSiteIds.length > 0) {
+    q = query(collection(db, BGV_COLLECTION), where('siteId', 'in', allowedSiteIds.slice(0, 30)));
+  }
   return onSnapshot(q, (snapshot) => {
     const records: BgvRecord[] = [];
     snapshot.forEach(docSnap => {
@@ -247,15 +252,15 @@ export const syncBgvCandidates = async (
       }
     }
 
-    if (!existingMap.has(docId) && !existingMap.has(badgeId)) {
-      // Find matching site
-      const matchedSite = bgvSites.find(s => 
-        s.id === (emp as any).currentSiteId ||
-        s.id === (emp as any).siteId ||
-        s.name.trim().toLowerCase() === String((emp as any).unit || (emp as any).siteName || (emp as any).currentSiteName || '').trim().toLowerCase() ||
-        ((emp as any).assignedSiteIds || []).includes(s.id)
-      ) || bgvSites[0];
+    // Find matching site
+    const matchedSite = bgvSites.find(s => 
+      s.id === (emp as any).currentSiteId ||
+      s.id === (emp as any).siteId ||
+      s.name.trim().toLowerCase() === String((emp as any).unit || (emp as any).siteName || (emp as any).currentSiteName || '').trim().toLowerCase() ||
+      ((emp as any).assignedSiteIds || []).includes(s.id)
+    ) || bgvSites[0];
 
+    if (!existingMap.has(docId) && !existingMap.has(badgeId)) {
       const recordId = `BGV-${badgeId || docId}`;
       const newRecord: BgvRecord = {
         id: recordId,
@@ -288,7 +293,7 @@ export const syncBgvCandidates = async (
         log.error(`[BGV] Failed to enroll candidate ${docId}:`, err);
       }
     } else {
-      // Existing record: refresh customFields and populate any missing essentials
+      // Existing record: refresh customFields and populate any missing essentials (UDF-AUD-281)
       const existing = existingMap.get(docId) || existingMap.get(badgeId);
       if (existing) {
         try {
@@ -296,6 +301,17 @@ export const syncBgvCandidates = async (
             customFields: customFields,
             updatedAt: new Date().toISOString()
           };
+          if (matchedSite && (existing.siteId !== matchedSite.id || existing.siteName !== matchedSite.name)) {
+            updates.siteId = matchedSite.id;
+            updates.siteName = matchedSite.name;
+          }
+          if ((emp as any).isRelieved || (emp as any).status === 'Relieved') {
+            updates.isRelieved = true;
+          }
+          if (fullName && existing.employeeName !== fullName) updates.employeeName = fullName;
+          if (badgeId && existing.employeeId !== badgeId) updates.employeeId = badgeId;
+          if ((emp as any).designation && existing.designation !== (emp as any).designation) updates.designation = (emp as any).designation;
+          if (phone && existing.phoneNumber !== phone) updates.phoneNumber = phone;
           if (!existing.dob && dob) updates.dob = dob;
           if (!existing.fatherName && fatherName) updates.fatherName = fatherName;
           if (!existing.aadhaarDocPath && aadhaarDoc) updates.aadhaarDocPath = aadhaarDoc;

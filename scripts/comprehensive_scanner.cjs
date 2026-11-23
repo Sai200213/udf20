@@ -5,7 +5,7 @@ const EXCLUDE_DIRS = ['node_modules', '.git', 'dist', 'dist-admin', 'dist-employ
 const EXCLUDE_FILES = ['package-lock.json', 'snyk_report.json', 'temp_posts.js'];
 const EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.rules', '.json'];
 const ROOT_DIR = path.resolve(__dirname, '..');
-const REPORT_PATH = path.resolve(process.env.APPDATA_DIR || 'C:/Users/muthy/.gemini/antigravity-ide/brain/24acec6e-4378-4891-a22b-b905a6a9df6e', 'CODE_SCAN_REPORT.md');
+const REPORT_PATH = path.resolve(ROOT_DIR, 'CODE_SCAN_REPORT.md');
 
 let totalLinesFound = 0;
 let linesScanned = 0;

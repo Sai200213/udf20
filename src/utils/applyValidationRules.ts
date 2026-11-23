@@ -29,23 +29,24 @@ interface ValidationRule {
 }
 
 // Exact label matches (case-insensitive)
+// Note: Name and bank fields use 'alphanumeric_special' to permit spaces, initials, hyphens, and apostrophes (UDF-AUD-110)
 const EXACT_RULES: Record<string, ValidationRule> = {
-    'full name': { allowedPattern: 'alphabets', minLength: 2, maxLength: 100 },
+    'full name': { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 100 },
     'phone number': { allowedPattern: 'numbers', minLength: 10, maxLength: 10 },
     'date of birth': { minAge: 18 },
     'height': { allowedPattern: 'alphanumeric', minLength: 1, maxLength: 10 },
     'identity marks': { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 200 },
-    'spouse name': { allowedPattern: 'alphabets', minLength: 2, maxLength: 100 },
+    'spouse name': { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 100 },
 
     // Reference Section
-    'reference name': { allowedPattern: 'alphabets', minLength: 2, maxLength: 100 },
-    'reference relationship': { allowedPattern: 'alphabets', minLength: 2, maxLength: 50 },
+    'reference name': { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 100 },
+    'reference relationship': { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 50 },
     'reference address': { allowedPattern: 'alphanumeric_special', minLength: 5, maxLength: 300 },
     'reference contact no': { allowedPattern: 'numbers', minLength: 10, maxLength: 10 },
 
     // Family Details
-    "father's name": { allowedPattern: 'alphabets', minLength: 2, maxLength: 100 },
-    "mother's name": { allowedPattern: 'alphabets', minLength: 2, maxLength: 100 },
+    "father's name": { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 100 },
+    "mother's name": { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 100 },
     "father's mobile number": { allowedPattern: 'numbers', minLength: 10, maxLength: 10 },
     "mother's mobile number": { allowedPattern: 'numbers', minLength: 10, maxLength: 10 },
 
@@ -57,10 +58,10 @@ const EXACT_RULES: Record<string, ValidationRule> = {
     'pvc number (if yes)': { allowedPattern: 'alphanumeric', minLength: 3, maxLength: 30 },
 
     // Bank Details
-    'bank name': { allowedPattern: 'alphabets', minLength: 2, maxLength: 100 },
+    'bank name': { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 100 },
     'account no': { allowedPattern: 'numbers', minLength: 8, maxLength: 18 },
     'ifsc code': { allowedPattern: 'alphanumeric', minLength: 11, maxLength: 11 },
-    'branch name': { allowedPattern: 'alphabets', minLength: 2, maxLength: 100 },
+    'branch name': { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 100 },
 
     // Address
     'present address': { allowedPattern: 'alphanumeric_special', minLength: 10, maxLength: 500 },
@@ -80,7 +81,7 @@ function getKeywordRule(label: string): ValidationRule | null {
     }
     // Name fields
     if ((l.includes('name') && !l.includes('company')) || l.includes("father's") || l.includes("mother's")) {
-        return { allowedPattern: 'alphabets', minLength: 2, maxLength: 100 };
+        return { allowedPattern: 'alphanumeric_special', minLength: 2, maxLength: 100 };
     }
     // Address fields
     if (l.includes('address')) {
@@ -128,8 +129,8 @@ export async function runMigration() {
                 const rule = getValidationRules(field.label);
                 const originalField = { ...field }; // Keep a copy to check if changes were made
 
-                // Apply allowedPattern if not already set
-                if (rule.allowedPattern && !field.allowedPattern) {
+                // Apply allowedPattern if not already set or set to any (UDF-AUD-280)
+                if (rule.allowedPattern && (!field.allowedPattern || field.allowedPattern === 'any')) {
                     field.allowedPattern = rule.allowedPattern;
                 }
 
@@ -166,8 +167,8 @@ export async function runMigration() {
             return { ...section, fields: updatedFields };
         });
 
-        // Save back to Firestore
-        await setDoc(docRef, { sections: updatedSections });
+        // Save back to Firestore with merge to protect document metadata (UDF-AUD-280)
+        await setDoc(docRef, { sections: updatedSections }, { merge: true });
 
         log.log(`\n🎉 Migration complete!`);
         log.log(`   Updated: ${updatedCount} fields`);

@@ -8,7 +8,9 @@ import Input from './common/Input';
 import Select from './common/Select';
 import { Search, Building, User, Phone, Tag, Filter, Database, ShieldAlert, Info, Edit3, Trash2, RotateCcw, Settings, X, CheckCircle, AlertTriangle, RefreshCw, ChevronDown, UserMinus, UserPlus, Calendar, PlusCircle, Briefcase, Plus, ShieldCheck, MapPin, LogOut, Upload, FileClock, Clock, Lock, Mail, Globe, Key, Shield, FileText, ArrowUpDown, ArrowDown, ArrowUp, Layout, Columns, Save, ShieldHalf, Award, TrendingUp, Printer } from 'lucide-react';
 import { getPaginatedSubmissions, getPaginatedEmployees, assignToSite, relieveFromSite, promoteEmployee, adminUpdateEmployeeEmail, adminSetAuthProvider, adminUnlinkGoogleAccount, adminResetEmployeePassword, adminResetToDefaultPassword, updateEmployeeClientIds, getEmployeeStatsCounts } from '../src/services/employeeService';
-import { QueryDocumentSnapshot } from 'firebase/firestore';
+import { QueryDocumentSnapshot, collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { db } from '../src/firebase/config';
+import { toast } from 'react-hot-toast';
 import { v4 as uuidv4 } from 'uuid';
 import BulkImportModal from './BulkImportModal';
 import { BulkImportResult } from '../src/utils/bulkImportUtils';
@@ -192,6 +194,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
 
   const hasViewScopeAll = effectiveIsSuperAdmin || hasPermission(Permission.EMPLOYEES_VIEW_SCOPE_ALL);
   const canPromote = isSuperAdmin || effectiveIsSuperAdmin || hasPermission(Permission.EMPLOYEES_ACTION_PROMOTE) || hasPermission(Permission.EMPLOYEES_EDIT_PROFILE) || hasPermission(Permission.EMPLOYEES_MANAGE_DEPLOYMENTS);
+  const canRelieve = isSuperAdmin || effectiveIsSuperAdmin || hasPermission(Permission.EMPLOYEES_ACTION_RELIEVE) || hasPermission(Permission.RESIGNATIONS_APPROVE);
 
   // Auth Management State
   const [isAuthUpdating, setIsAuthUpdating] = useState(false);
@@ -220,6 +223,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
   }, [isSuperAdmin, userRole]);
 
   const hasTabPermission = useCallback((tab: 'ACTIVE' | 'PENDING' | 'RELIEVED' | 'RECYCLE_BIN') => {
+    if (isSuperAdmin) return true;
     switch (tab) {
       case 'ACTIVE':
         return hasPermission(Permission.EMPLOYEES_TAB_ACTIVE);
@@ -249,14 +253,15 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
   }, [userRole, isSuperAdmin, hasTabPermission, viewMode]);
 
   React.useEffect(() => {
-    const saved = localStorage.getItem('masterListColumnPrefs');
+    const userKey = `masterListColumnPrefs_${authUser?.id || 'default'}`;
+    const saved = localStorage.getItem(userKey) || localStorage.getItem('masterListColumnPrefs');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
         setUserVisibleColumns(new Set(parsed));
       } catch (e) { }
     }
-  }, []);
+  }, [authUser?.id]);
 
   // Synchronize local table data immediately when an employee is purged or deleted
   React.useEffect(() => {
@@ -274,11 +279,12 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
       const next = new Set(prev);
       if (next.has(colId)) next.delete(colId);
       else next.add(colId);
-      // Persist to localStorage
-      localStorage.setItem('masterListColumnPrefs', JSON.stringify(Array.from(next)));
+      // Persist to localStorage scoped to logged-in user
+      const userKey = `masterListColumnPrefs_${authUser?.id || 'default'}`;
+      localStorage.setItem(userKey, JSON.stringify(Array.from(next)));
       return next;
     });
-  }, []);
+  }, [authUser?.id]);
 
   const isVisible = useCallback((fieldId: string) => {
     // 1. Auth Column Permission Check
@@ -305,19 +311,24 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
     setIsUpdatingJoiningDate(true);
     try {
       const { updateEmployeeJoiningDate } = await import('../src/services/employeeService');
+      const parsedDate = new Date(newJoiningDateValue);
+      if (Number.isNaN(parsedDate.getTime())) {
+        throw new Error('Invalid joining date format.');
+      }
+      // Save string date directly (YYYY-MM-DD) to prevent timezone rollback (UDF-AUD-121)
+      const saveDate = newJoiningDateValue;
+
       await updateEmployeeJoiningDate(
         managementTarget.id,
-        newJoiningDateValue,
+        saveDate,
         updateOriginalJoinDate
       );
-
-      const isoDate = new Date(newJoiningDateValue).toISOString();
       setManagementTarget(prev => {
         if (!prev) return null;
         return {
           ...prev,
-          joiningDate: isoDate,
-          originalJoiningDate: updateOriginalJoinDate ? isoDate : (prev as any).originalJoiningDate
+          joiningDate: saveDate,
+          originalJoiningDate: updateOriginalJoinDate ? saveDate : (prev as any).originalJoiningDate
         };
       });
 
@@ -325,8 +336,8 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
         if (emp.id === managementTarget.id || (emp as any).employeeId === managementTarget.employeeId) {
           return {
             ...emp,
-            joiningDate: isoDate,
-            originalJoiningDate: updateOriginalJoinDate ? isoDate : (emp as any).originalJoiningDate
+            joiningDate: saveDate,
+            originalJoiningDate: updateOriginalJoinDate ? saveDate : (emp as any).originalJoiningDate
           };
         }
         return emp;
@@ -460,7 +471,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
         .flatMap(s => s.fields || [])
         .find(f => f && f.label && (f.label.toLowerCase().includes('unit') || f.label.toLowerCase().includes('facility')));
 
-      const searchFieldToUse = searchTerm && /^[0-9A-Za-z-]+$/.test(searchTerm) && /\d/.test(searchTerm) ? 'employeeId' : 'applicantName';
+      const searchFieldToUse = debouncedSearchTerm && /^[0-9A-Za-z-]+$/.test(debouncedSearchTerm) && /\d/.test(debouncedSearchTerm) ? 'employeeId' : 'applicantName';
 
       const selectedSiteObj = safeSites.find(s => s.id === selectedSite || s.name === selectedSite);
       const siteIdToQuery = selectedSiteObj ? selectedSiteObj.id : selectedSite;
@@ -471,7 +482,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
         currentLastDoc,
         selectedSite !== 'ALL' ? 'currentSiteId' : undefined,
         selectedSite !== 'ALL' ? siteIdToQuery : undefined,
-        searchTerm,
+        debouncedSearchTerm,
         searchFieldToUse,
         hasViewScopeAll ? 'ALL' : (effectiveAllowedSiteIds || [])
       );
@@ -625,7 +636,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
 
   const canExport = isSuperAdmin || hasPermission(Permission.EXPORT_DATA);
   const canDelete = isSuperAdmin || hasPermission(Permission.DELETE_EMPLOYEE);
-  const canViewSensitive = isSuperAdmin || hasPermission(Permission.VIEW_SENSITIVE_INFO);
+  const canViewSensitive = isSuperAdmin || hasPermission(Permission.VIEW_SENSITIVE_INFO) || hasPermission(Permission.EMPLOYEES_VIEW_SENSITIVE_INFO);
 
   const isSensitiveField = (label: string) => {
     const sensitiveKeywords = ['mobile', 'phone', 'email', 'bank', 'account', 'aadhaar', 'pan', 'ifsc', 'salary', 'ctc', 'amount'];
@@ -827,12 +838,12 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
       )}
 
       {/* Quick Stats Bar */}
-      <div className={`grid grid-cols-2 ${hasPermission(Permission.EMPLOYEES_MANAGE_SECURITY) ? 'md:grid-cols-4' : 'md:grid-cols-2'} gap-4`}>
+      <div className={`grid grid-cols-2 ${isSuperAdmin && hasPermission(Permission.EMPLOYEES_MANAGE_SECURITY) ? 'md:grid-cols-4' : 'md:grid-cols-2'} gap-4`}>
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4 flex items-center">
           <div className="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center mr-3"><User size={20} className="text-blue-600" /></div>
           <div><p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Total Monitored</p><p className="text-xl font-black text-gray-800">{companyStats.total}</p></div>
         </div>
-        {hasPermission(Permission.EMPLOYEES_MANAGE_SECURITY) && (
+        {isSuperAdmin && hasPermission(Permission.EMPLOYEES_MANAGE_SECURITY) && (
           <>
             <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4 flex items-center">
               <div className="w-10 h-10 rounded-full bg-green-50 flex items-center justify-center mr-3"><Globe size={20} className="text-green-600" /></div>
@@ -908,7 +919,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
               <Button
                 variant="secondary"
                 size="sm"
-                onClick={() => onExport(employees)}
+                onClick={() => onExport(filteredEmployees)}
                 className="flex items-center bg-green-50 text-green-700 hover:bg-green-100 border-green-200"
               >
                 <Upload size={16} className="mr-2 rotate-180" />
@@ -937,10 +948,12 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                 value={selectedSite}
                 onChange={e => setSelectedSite(e.target.value)}
               >
-                <option value="ALL">All Company Sites</option>
-                {safeSites.filter(s => s && s.status === 'Active').map(s => (
-                  <option key={s.id} value={s.id}>{s.name}</option>
-                ))}
+                <option value="ALL">{hasViewScopeAll ? 'All Company Sites' : 'All Assigned Sites'}</option>
+                {safeSites
+                  .filter(s => s && s.status === 'Active' && (hasViewScopeAll || effectiveAllowedSiteIds.includes(s.id)))
+                  .map(s => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
               </select>
             </div>
             {(searchTerm || selectedSite !== 'ALL') && (
@@ -1207,11 +1220,16 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                       )}
                       {isVisible('joiningDate') && (
                         <td className="px-6 py-4 whitespace-nowrap text-center text-xs font-bold text-gray-400">
-                          {viewMode === 'RELIEVED' && (safeEmp as any).relievingDate
-                            ? new Date((safeEmp as any).relievingDate).toLocaleDateString()
-                            : ((safeEmp as any).joiningDate || emp.timestamp)
-                              ? new Date(emp.timestamp || (safeEmp as any).joiningDate).toLocaleDateString()
-                              : 'N/A'}
+                          {(() => {
+                            if (viewMode === 'RELIEVED' && (safeEmp as any).relievingDate) {
+                              const d = new Date((safeEmp as any).relievingDate);
+                              return Number.isNaN(d.getTime()) ? 'N/A' : d.toLocaleDateString();
+                            }
+                            const rawDate = (safeEmp as any).joiningDate || emp.timestamp;
+                            if (!rawDate) return 'N/A';
+                            const d = new Date(rawDate);
+                            return Number.isNaN(d.getTime()) ? 'N/A' : d.toLocaleDateString();
+                          })()}
                         </td>
                       )}
                     </tr>
@@ -1257,7 +1275,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                     Client IDs
                   </button>
                 )}
-                {hasPermission(Permission.EMPLOYEES_MANAGE_SECURITY) && (
+                {isSuperAdmin && hasPermission(Permission.EMPLOYEES_MANAGE_SECURITY) && (
                   <button
                     onClick={() => setActiveTab('SECURITY' as any)}
                     className={`py-3 px-4 text-xs font-bold uppercase tracking-widest transition-all border-b-2 ${activeTab === ('SECURITY' as any) ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-400 hover:text-slate-600'}`}
@@ -1647,7 +1665,25 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                                           size="sm"
                                           className="mt-3 w-full border-amber-300 text-amber-700 hover:bg-amber-100"
                                           onClick={async () => {
-                                            alert("Reminder feature coming soon.");
+                                            try {
+                                              const targetUserId = managementTarget?.portalId || managementTarget?.employeeId || (managementTarget as any)?.id || managementTarget?.uid;
+                                              if (!targetUserId) {
+                                                toast.error("Could not find employee ID to send reminder.");
+                                                return;
+                                              }
+                                              await addDoc(collection(db, 'notifications'), {
+                                                userId: targetUserId,
+                                                title: "Action Required: Complete Your Profile",
+                                                message: "Your onboarding profile has not been submitted yet. Please complete all required sections and submit your profile for HR approval.",
+                                                type: "PROFILE_NUDGE",
+                                                read: false,
+                                                createdAt: serverTimestamp()
+                                              });
+                                              toast.success("Reminder nudge sent to employee successfully!");
+                                            } catch (nudgeErr: any) {
+                                              console.error("Error sending nudge:", nudgeErr);
+                                              toast.error(nudgeErr?.message || "Failed to send reminder.");
+                                            }
                                           }}
                                         >
                                           <div className="flex items-center justify-center">
@@ -1669,7 +1705,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                                       <Award size={16} className="mr-2" /> Promote Employee
                                     </Button>
                                   )}
-                                  {(isSuperAdmin || userRole?.permissions.includes(Permission.EMPLOYEES_ACTION_RELIEVE)) && (
+                                  {canRelieve && (
                                     <Button variant="secondary" className="w-full bg-purple-600 text-white font-bold" onClick={() => {
                                       setRelieveDate(new Date().toISOString().split('T')[0]);
                                       setRelieveReason('Resignation');
@@ -1738,6 +1774,10 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                                       const reason = prompt("Relieving Reason?", "Resignation") || "Other";
                                       await relieveFromSite(managementTarget.id, asgn.id, new Date().toISOString(), reason);
                                       // Local update for immediate feedback
+                                      setManagementTarget(prev => prev ? {
+                                        ...prev,
+                                        activeAssignments: (prev.activeAssignments || []).filter(a => a.id !== asgn.id)
+                                      } : null);
                                       setPaginatedData(prev => prev.map(emp => emp.id === managementTarget.id ? {
                                         ...emp,
                                         activeAssignments: (emp.activeAssignments || []).filter(a => a.id !== asgn.id)
@@ -1760,7 +1800,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                       <div className="grid grid-cols-2 gap-3">
                         <Select label="Deployment Site" value={newAssignmentSiteId} onChange={e => { setNewAssignmentSiteId(e.target.value); setNewAssignmentSubUnitId(''); setNewAssignmentDesignation(''); }}>
                           <option value="">Select Site...</option>
-                          {safeSites.filter(s => s && s.status === 'Active').map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                          {safeSites.filter(s => s && s.status === 'Active' && (!effectiveAllowedSiteIds || effectiveAllowedSiteIds.length === 0 || effectiveAllowedSiteIds.includes(s.id))).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
                         </Select>
                         <Select label="Sub-unit (Optional)" value={newAssignmentSubUnitId} onChange={e => setNewAssignmentSubUnitId(e.target.value)} disabled={!newAssignmentSiteId}>
                           <option value="">No specific unit</option>
@@ -1800,9 +1840,14 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                               status: 'Active' as const
                             };
                             await assignToSite(managementTarget.id, (newAsgn as any));
+                            const tempAsgn = { ...newAsgn, id: 'temp-' + Date.now() };
+                            setManagementTarget(prev => prev ? {
+                              ...prev,
+                              activeAssignments: [...(prev.activeAssignments || []), tempAsgn]
+                            } : null);
                             setPaginatedData(prev => prev.map(emp => emp.id === managementTarget.id ? {
                               ...emp,
-                              activeAssignments: [...(emp.activeAssignments || []), { ...newAsgn, id: 'temp-' + Date.now() }]
+                              activeAssignments: [...(emp.activeAssignments || []), tempAsgn]
                             } as any : emp));
                             setNewAssignmentSiteId('');
                           } finally {
@@ -1872,7 +1917,13 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
 
                                     // Validate
                                     let isValid = true;
-                                    if (def.pattern) isValid = new RegExp(def.pattern).test(value);
+                                    if (def.pattern) {
+      try {
+        isValid = new RegExp(def.pattern).test(value);
+      } catch {
+        isValid = true;
+      }
+    }
                                     if (def.minLength && value.length < def.minLength) isValid = false;
                                     if (def.maxLength && value.length > def.maxLength) isValid = false;
 
@@ -2167,44 +2218,6 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"
                   />
                 </div>
-                {isRehiring && (
-                  <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">New Employee ID</label>
-                    <Input
-                      value={rehireId}
-                      onChange={(e) => setRehireId(e.target.value)}
-                      placeholder="Enter new ID (e.g. HY123456)"
-                    />
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Select Documents to Copy</label>
-                    <div className="space-y-2 bg-gray-50 p-3 rounded-lg border border-gray-200">
-                      {["Joining Documents", "Leave Requests", "Account Updates", "Resignations", "Disciplinary Actions"].map(folder => (
-                        <div key={folder} className="flex items-center">
-                          <input
-                            type="checkbox"
-                            id={`folder-${folder}`}
-                            className="h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-                            checked={selectedFolders.includes(folder)}
-                            onChange={(e) => {
-                              if (e.target.checked) {
-                                setSelectedFolders(prev => [...prev, folder]);
-                              } else {
-                                setSelectedFolders(prev => prev.filter(f => f !== folder));
-                              }
-                            }}
-                          />
-                          <label htmlFor={`folder-${folder}`} className="ml-2 block text-sm text-gray-700">
-                            {folder}
-                          </label>
-                        </div>
-                      ))}
-                    </div>
-                    <p className="text-xs text-gray-500 mt-2 ml-1">
-                      {selectedFolders.includes("Joining Documents")
-                        ? "✅ Employee will be ACTIVE immediately (Profile considered complete)."
-                        : "⚠️ Employee will be PENDING until new Joining Documents are uploaded."}
-                    </p>
-                  </div>
-                )}
                 <div>
                   <label className="block text-sm font-bold text-gray-700 mb-1">Site *</label>
                   <select
@@ -2216,7 +2229,7 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"
                   >
                     <option value="">Select Site</option>
-                    {sites.filter(s => s && s.status === 'Active').map(site => (
+                    {sites.filter(s => s && s.status === 'Active' && (!effectiveAllowedSiteIds || effectiveAllowedSiteIds.length === 0 || effectiveAllowedSiteIds.includes(s.id))).map(site => (
                       <option key={site.id} value={site.id}>{site.name}</option>
                     ))}
                   </select>
@@ -2291,18 +2304,51 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                   </div>
 
                   {isRehiring && (
-                    <div>
-                      <label className="block text-xs text-gray-500 mb-1 ml-6">New Employee ID</label>
-                      <input
-                        type="text"
-                        value={rehireId}
-                        onChange={(e) => setRehireId(e.target.value)}
-                        className="w-full ml-6 px-3 py-1.5 text-sm border border-gray-300 rounded focus:ring-1 focus:ring-green-500 focus:border-green-500 w-[calc(100%-1.5rem)]"
-                        placeholder="e.g. EMP-101"
-                      />
-                      <p className="text-xs text-gray-500 mt-1 ml-6">
-                        This will create a new employee record and link the old one as history.
-                      </p>
+                    <div className="space-y-3 mt-3">
+                      <div>
+                        <label className="block text-xs text-gray-500 mb-1 ml-6">New Employee ID</label>
+                        <input
+                          type="text"
+                          value={rehireId}
+                          onChange={(e) => setRehireId(e.target.value)}
+                          className="w-full ml-6 px-3 py-1.5 text-sm border border-gray-300 rounded focus:ring-1 focus:ring-green-500 focus:border-green-500 w-[calc(100%-1.5rem)]"
+                          placeholder="e.g. EMP-101"
+                        />
+                        <p className="text-xs text-gray-500 mt-1 ml-6">
+                          This will create a new employee record and link the old one as history.
+                        </p>
+                      </div>
+
+                      <div className="ml-6">
+                        <label className="block text-xs font-medium text-gray-700 mb-1.5">Select Documents to Copy</label>
+                        <div className="space-y-1.5 bg-white p-2.5 rounded-lg border border-gray-200">
+                          {["Joining Documents", "Leave Requests", "Account Updates", "Resignations", "Disciplinary Actions"].map(folder => (
+                            <div key={folder} className="flex items-center">
+                              <input
+                                type="checkbox"
+                                id={`folder-${folder}`}
+                                className="h-3.5 w-3.5 text-green-600 border-gray-300 rounded focus:ring-green-500"
+                                checked={selectedFolders.includes(folder)}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedFolders(prev => [...prev, folder]);
+                                  } else {
+                                    setSelectedFolders(prev => prev.filter(f => f !== folder));
+                                  }
+                                }}
+                              />
+                              <label htmlFor={`folder-${folder}`} className="ml-2 block text-xs text-gray-700">
+                                {folder}
+                              </label>
+                            </div>
+                          ))}
+                        </div>
+                        <p className="text-[11px] text-gray-500 mt-1">
+                          {selectedFolders.includes("Joining Documents")
+                            ? "✅ Employee will be ACTIVE immediately."
+                            : "⚠️ Employee will be PENDING until new Joining Documents are uploaded."}
+                        </p>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -2378,11 +2424,15 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
             <div className="p-4 border-b border-gray-100 flex gap-2">
               <Button variant="secondary" size="sm" className="flex-1 text-[10px] font-black uppercase tracking-widest" onClick={() => {
                 setUserVisibleColumns(new Set());
+                const userKey = `masterListColumnPrefs_${authUser?.id || 'default'}`;
+                localStorage.removeItem(userKey);
                 localStorage.removeItem('masterListColumnPrefs');
               }}>Show All</Button>
               <Button variant="outline" size="sm" className="flex-1 text-[10px] font-black uppercase tracking-widest text-slate-500" onClick={() => {
                 const minimalSet = new Set(['name', 'employeeId']);
                 setUserVisibleColumns(minimalSet);
+                const userKey = `masterListColumnPrefs_${authUser?.id || 'default'}`;
+                localStorage.setItem(userKey, JSON.stringify(Array.from(minimalSet)));
                 localStorage.setItem('masterListColumnPrefs', JSON.stringify(Array.from(minimalSet)));
               }}>Hide Most</Button>
             </div>
@@ -2409,6 +2459,8 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                         }));
                         newSet.delete(col.id);
                         setUserVisibleColumns(newSet);
+                        const userKey = `masterListColumnPrefs_${authUser?.id || 'default'}`;
+                        localStorage.setItem(userKey, JSON.stringify(Array.from(newSet)));
                         localStorage.setItem('masterListColumnPrefs', JSON.stringify(Array.from(newSet)));
                       } else {
                         toggleColumnVisibility(col.id);
@@ -2437,6 +2489,8 @@ const AdminMasterEmployeeListPage: React.FC<AdminMasterEmployeeListPageProps> = 
                         }));
                         newSet.delete(field.id);
                         setUserVisibleColumns(newSet);
+                        const userKey = `masterListColumnPrefs_${authUser?.id || 'default'}`;
+                        localStorage.setItem(userKey, JSON.stringify(Array.from(newSet)));
                         localStorage.setItem('masterListColumnPrefs', JSON.stringify(Array.from(newSet)));
                       } else {
                         toggleColumnVisibility(field.id);

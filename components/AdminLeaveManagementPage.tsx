@@ -62,8 +62,9 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
         return () => { cancelled = true; };
     }, [selectedRequest?.employeeId]);
     const [isLookupLoading, setIsLookupLoading] = useState(false);
+    const [isProcessingAction, setIsProcessingAction] = useState(false);
 
-    // On-demand historical data (Approved/Rejected records loaded when tab is clicked)
+    // On-demand historical data (Approved/Rejected/ALL records loaded when tab is clicked)
     const [historicalRequests, setHistoricalRequests] = useState<LeaveRequest[]>([]);
     const [isLoadingHistorical, setIsLoadingHistorical] = useState(false);
 
@@ -82,8 +83,21 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
     }, [leavePolicy]);
 
     const config = workflowConfigs.find(c => c.moduleId === 'LEAVES');
-    const hasManagePerm = isSuperAdmin || userRole?.permissions.includes(Permission.MANAGE_LEAVES);
-    const hasPermission = (p: Permission) => isSuperAdmin || userRole?.permissions.includes(p) || false;
+    const hasPermission = (p: Permission) => {
+        if (isSuperAdmin) return true;
+        if (userRole?.isDisabled) return false;
+        const userOverrides = (authUser as any)?.permissionOverrides;
+        if (userOverrides && userOverrides[p] !== undefined) {
+            return !!userOverrides[p];
+        }
+        return Boolean(userRole?.permissions?.includes(p));
+    };
+
+    const hasManagePerm = isSuperAdmin || 
+      hasPermission(Permission.MANAGE_LEAVES) ||
+      hasPermission(Permission.LEAVES_APPROVE);
+
+    const canManagePolicy = isSuperAdmin || hasPermission(Permission.MANAGE_SYSTEM) || hasPermission(Permission.LEAVES_MANAGE_BALANCES);
 
     const canReview = (req: LeaveRequest) => {
         if (isSuperAdmin) return true;
@@ -97,11 +111,12 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
         return currentLevelConfig?.roleId === userRole?.id;
     };
 
-    // Fetch historical data on-demand when filter changes to Approved/Rejected
+    // Fetch historical data on-demand when filter changes to Approved/Rejected or ALL
     useEffect(() => {
-        if (filterStatus === RequestStatus.APPROVED || filterStatus === RequestStatus.REJECTED) {
+        if (filterStatus === RequestStatus.APPROVED || filterStatus === RequestStatus.REJECTED || filterStatus === 'ALL') {
             setIsLoadingHistorical(true);
-            fetchLeaveRequestsByStatus(filterStatus, allowedSiteIds, 200)
+            const targetStatus = filterStatus === 'ALL' ? undefined : filterStatus;
+            fetchLeaveRequestsByStatus(targetStatus, allowedSiteIds, 200)
                 .then(data => setHistoricalRequests(data))
                 .catch(err => console.error('Failed to fetch historical leave data:', err))
                 .finally(() => setIsLoadingHistorical(false));
@@ -111,9 +126,15 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
     }, [filterStatus, allowedSiteIds]);
 
     const getEmployeeBalance = (employeeId: string, type: string) => {
-        // BUG-A56-01: Compute balance directly from master employees collection for Admins
-        if (selectedEmpRecord && (selectedEmpRecord.employeeId === employeeId || selectedEmpRecord.id === employeeId)) {
-            const empLeaves = allRequests.filter(r => (r.employeeId === employeeId || r.employeeId === selectedEmpRecord.employeeId) && r.status === 'Approved');
+        // Compute balance directly from master employees collection or selected record (UDF-AUD-64)
+        const matchesSelected = selectedEmpRecord && (
+            selectedEmpRecord.employeeId === employeeId ||
+            selectedEmpRecord.id === employeeId ||
+            selectedEmpRecord.portalId === employeeId ||
+            (selectedRequest && selectedRequest.employeeId === employeeId)
+        );
+
+        if (matchesSelected) {
             const keyMap: Record<string, string> = {
                 'Casual Leave': 'casual',
                 'Sick Leave': 'sick',
@@ -121,7 +142,7 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
                 'Privilege Leave': 'privilege'
             };
             const shortKey = keyMap[type] || type.toLowerCase();
-            const configType = leavePolicy?.leaveTypes?.find(lt => lt.label === type || lt.typeId === type);
+            const configType = leavePolicy?.leaveTypes?.find(lt => lt.label === type || lt.typeId === type || lt.typeId === shortKey);
             const total = configType?.defaultQuota ?? 12;
             const hasExplicitRemaining = selectedEmpRecord.leaveBalance?.[shortKey] !== undefined;
             const remaining = hasExplicitRemaining ? Number(selectedEmpRecord.leaveBalance[shortKey]) : total;
@@ -131,7 +152,11 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
             return { total, used, remaining: Math.max(0, remaining) };
         }
 
-        const empBalance = leaveBalances.find(b => b.employeeId === employeeId);
+        const empBalance = leaveBalances.find(b => 
+            b.employeeId === employeeId || 
+            b.id === employeeId || 
+            (b as any).portalId === employeeId
+        );
         if (!empBalance) return { total: 0, used: 0, remaining: 0 };
         const bal = empBalance.balances[type];
         if (type === LeaveType.UNPAID) return { total: '∞', used: bal?.used || 0, remaining: '∞' };
@@ -202,7 +227,7 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
 
     return (
         <div className="p-0">
-            {isSuperAdmin && (
+            {(isSuperAdmin || canManagePolicy) && (
                 <div className="flex space-x-4 mb-6 border-b border-gray-200 pb-2">
                     <button onClick={() => setActiveTab('REQUESTS')} className={`flex items-center space-x-2 px-4 py-2 border-b-2 font-medium text-sm transition-colors ${activeTab === 'REQUESTS' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}>
                         <CalendarCheck size={18} /><span>Leave Requests</span>
@@ -364,8 +389,10 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
                                     variant="danger"
                                     size="sm"
                                     onClick={() => {
-                                        if (onDelete) {
-                                            onDelete(selectedRequest.id);
+                                        if (onDelete && selectedRequest) {
+                                            const idToDelete = selectedRequest.id;
+                                            onDelete(idToDelete);
+                                            setHistoricalRequests(prev => prev.filter(r => r.id !== idToDelete));
                                             closeDetailsModal();
                                         }
                                     }}
@@ -449,11 +476,17 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
                                                          <Button
                                                              variant="secondary"
                                                              size="sm"
-                                                             onClick={() => {
+                                                             disabled={isProcessingAction}
+                                                             onClick={async () => {
                                                                  const target = isSuperAdmin ? revertTargetLevel : effectiveLevel - 1;
                                                                  if (window.confirm(`Revert to Level ${target}?`)) {
-                                                                     onRevert?.(selectedRequest.id, target);
-                                                                     closeDetailsModal();
+                                                                     try {
+                                                                         setIsProcessingAction(true);
+                                                                         await onRevert?.(selectedRequest.id, target);
+                                                                         closeDetailsModal();
+                                                                     } finally {
+                                                                         setIsProcessingAction(false);
+                                                                     }
                                                                  }
                                                              }}
                                                              className="bg-amber-100 text-amber-700"
@@ -467,7 +500,21 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
                                     })()}
                                     <div className="flex gap-2">
                                         {hasPermission(Permission.LEAVES_REJECT) && (
-                                            <Button variant="danger" onClick={() => { onAction(selectedRequest.id, RequestStatus.REJECTED, adminComments); closeDetailsModal(); }}>Reject</Button>
+                                            <Button 
+                                                variant="danger" 
+                                                disabled={isProcessingAction}
+                                                onClick={async () => { 
+                                                    try {
+                                                        setIsProcessingAction(true);
+                                                        await onAction(selectedRequest.id, RequestStatus.REJECTED, adminComments); 
+                                                        closeDetailsModal(); 
+                                                    } finally {
+                                                        setIsProcessingAction(false);
+                                                    }
+                                                }}
+                                            >
+                                                Reject
+                                            </Button>
                                         )}
                                         {hasPermission(Permission.LEAVES_APPROVE) && (() => {
                                             const site = sites.find(s => s.id === selectedRequest.siteId);
@@ -479,7 +526,16 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
                                                 <div className="flex gap-2">
                                                     <Button 
                                                         variant="primary" 
-                                                        onClick={() => { onAction(selectedRequest.id, RequestStatus.APPROVED, adminComments, false); closeDetailsModal(); }} 
+                                                        disabled={isProcessingAction}
+                                                        onClick={async () => { 
+                                                            try {
+                                                                setIsProcessingAction(true);
+                                                                await onAction(selectedRequest.id, RequestStatus.APPROVED, adminComments, false); 
+                                                                closeDetailsModal(); 
+                                                            } finally {
+                                                                setIsProcessingAction(false);
+                                                            }
+                                                        }} 
                                                         className="bg-green-600 hover:bg-green-700"
                                                     >
                                                         {hasMoreLevels ? `Approve Level ${effectiveLevel}` : 'Final Approval'}
@@ -487,10 +543,16 @@ const AdminLeaveManagementPage: React.FC<AdminLeaveManagementPageProps> = ({
                                                     {isSuperAdmin && hasMoreLevels && (
                                                         <Button 
                                                             variant="primary" 
-                                                            onClick={() => { 
+                                                            disabled={isProcessingAction}
+                                                            onClick={async () => { 
                                                                 if (window.confirm("Bypass remaining levels and grant Direct Final Approval?")) {
-                                                                    onAction(selectedRequest.id, RequestStatus.APPROVED, adminComments, true); 
-                                                                    closeDetailsModal(); 
+                                                                    try {
+                                                                        setIsProcessingAction(true);
+                                                                        await onAction(selectedRequest.id, RequestStatus.APPROVED, adminComments, true); 
+                                                                        closeDetailsModal(); 
+                                                                    } finally {
+                                                                        setIsProcessingAction(false);
+                                                                    }
                                                                 }
                                                             }} 
                                                             className="bg-emerald-700 hover:bg-emerald-800 font-semibold"

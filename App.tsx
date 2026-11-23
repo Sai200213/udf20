@@ -620,10 +620,11 @@ const App: React.FC = () => {
   const reorderSections = useCallback(async (src: number, dest: number) => {
     try {
       sendNotification(authUser?.id || 'admin', `Moving section...`, 'info');
-      const res = Array.from(sectionsRef.current);
-      const [rem] = res.splice(src, 1);
-      res.splice(dest, 0, rem);
-      const nextSections = res.map((s, i) => ({ ...s as any, order: i }));
+      // Sort by current order first so visual index matches array index (UDF-AUD-65)
+      const sorted = [...sectionsRef.current].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      const [rem] = sorted.splice(src, 1);
+      sorted.splice(dest, 0, rem);
+      const nextSections = sorted.map((s, i) => ({ ...s as any, order: i }));
       await updateFormSections(nextSections);
       sendNotification(authUser?.id || 'admin', `Section order updated.`, 'success');
     } catch (err: any) {
@@ -742,15 +743,17 @@ const App: React.FC = () => {
         return field;
       }).filter(Boolean) as FormField[];
 
-      // In Job Details, guarantee Unit or Facility (order 1) comes before Post of Apply (order 2)
+      // In Job Details, guarantee Unit or Facility comes before Post of Apply without order collisions (UDF-AUD-65)
       if (section.id === 'eb4bf8a6-a8bd-4563-817d-792716e6474c' || section.name === 'Job Details') {
         const unitField = fields.find(f => f.id === '52ae217b-2602-4337-a1cd-a1f9bd36a4b0' || f.label === 'Unit or Facility');
         const postField = fields.find(f => f.id === 'db307195-cf54-4a6e-9056-f3974b050c4d' || f.label === 'Post of Apply' || f.label === 'Designation');
         if (unitField && postField) {
-          unitField.order = 1;
-          postField.order = 2;
+          const otherFields = fields.filter(f => f !== unitField && f !== postField);
+          fields = [unitField, postField, ...otherFields].map((f, idx) => ({
+            ...f,
+            order: idx + 1
+          }));
         }
-        fields.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
       }
 
       return {
@@ -943,6 +946,9 @@ const App: React.FC = () => {
       sessionStorage.removeItem('activeAdminView');
       sessionStorage.removeItem('activeEmployeeView');
       sessionStorage.removeItem('adminInvitesActiveTab');
+      sessionStorage.removeItem('activeTimelineEmployeeId');
+      sessionStorage.removeItem('adminTimelineSearchQuery');
+      sessionStorage.removeItem('activeStaffProfileId');
     } catch (e) {}
 
     // Immediately evict user from React state so protected pages unmount right away
@@ -996,8 +1002,13 @@ const App: React.FC = () => {
     window.addEventListener('touchstart', touchActivity, { passive: true });
     window.addEventListener('scroll', touchActivity, { passive: true });
 
+    let elapsed = 0;
     const checker = setInterval(() => {
-      if (isTimedOut) return;
+      elapsed += 10000;
+      if (isTimedOut) {
+        clearInterval(checker);
+        return;
+      }
       const raw = localStorage.getItem('udf_user_last_active');
       if (raw) {
         const lastActive = parseInt(raw, 10);
@@ -1125,30 +1136,29 @@ const App: React.FC = () => {
     setLeaveBalances(balances);
   }, [employees, leavePolicy]);
 
-  // Submissions subscription - On-demand for ADMINS (loads when tab opens, then cached for session)
+  // Submissions subscription - On-demand for ADMINS (loads once when tab opens, cached for session, UDF-AUD-61)
   // EMPLOYEES get only their own submissions
   const hasSubmissionsSubscribedRef = useRef(false);
+  const submissionsUnsubRef = useRef<() => void>(() => {});
+
   useEffect(() => {
     if (!authUser) {
       hasSubmissionsSubscribedRef.current = false;
+      submissionsUnsubRef.current();
+      submissionsUnsubRef.current = () => {};
       setSubmittedForms([]);
       return;
     }
 
-    let unsubSubmissions = () => { };
-
     if (authUser.type === UserType.ADMIN) {
-      // Enterprise Segregation: Candidate Onboarding pipeline loads on-demand for candidate views only
       const shouldSubscribe = 
         currentView === AppView.ADMIN_PORTAL_SUBMISSION_REVIEW || 
         currentView === AppView.ADMIN_PORTAL_DRAFTS || 
-        currentView === AppView.ADMIN_PORTAL_SITE_MANAGEMENT || 
-        currentView === AppView.ADMIN_DASHBOARD ||
-        hasSubmissionsSubscribedRef.current;
+        currentView === AppView.ADMIN_PORTAL_SITE_MANAGEMENT;
 
-      if (shouldSubscribe) {
+      if (shouldSubscribe && !hasSubmissionsSubscribedRef.current) {
         hasSubmissionsSubscribedRef.current = true;
-        unsubSubmissions = subscribeToSubmissions((data) => {
+        submissionsUnsubRef.current = subscribeToSubmissions((data) => {
           const mapped = data.map(d => ({
             ...d,
             data: d.formData,
@@ -1158,23 +1168,30 @@ const App: React.FC = () => {
         });
       }
     } else if (authUser.type === UserType.EMPLOYEE) {
-      log.log(`Setting up personal submission subscription for Employee: ${authUser.id}`);
-      unsubSubmissions = subscribeToSubmissionsByUid(authUser.id, (data) => {
-        const mapped = data.map(d => ({
-          ...d,
-          data: d.formData,
-          submissionDate: typeof d.timestamp === 'object' ? new Date().toISOString() : d.timestamp,
-        } as unknown as SubmittedFormData));
-        setSubmittedForms(mapped);
-      });
+      if (!hasSubmissionsSubscribedRef.current) {
+        hasSubmissionsSubscribedRef.current = true;
+        log.log(`Setting up personal submission subscription for Employee: ${authUser.id}`);
+        submissionsUnsubRef.current = subscribeToSubmissionsByUid(authUser.id, (data) => {
+          const mapped = data.map(d => ({
+            ...d,
+            data: d.formData,
+            submissionDate: typeof d.timestamp === 'object' ? new Date().toISOString() : d.timestamp,
+          } as unknown as SubmittedFormData));
+          setSubmittedForms(mapped);
+        });
+      }
     } else {
       setSubmittedForms([]);
     }
-
-    return () => {
-      unsubSubmissions();
-    };
   }, [authUser, setSubmittedForms, currentView]);
+
+  useEffect(() => {
+    return () => {
+      submissionsUnsubRef.current();
+      submissionsUnsubRef.current = () => {};
+      hasSubmissionsSubscribedRef.current = false;
+    };
+  }, []);
 
 
 
@@ -1197,7 +1214,7 @@ const App: React.FC = () => {
     legacyImportId?: string,
     selectedPassword?: string
   ) => {
-    if (checkWritesBlock()) return;
+    if (checkWritesBlock()) return { success: false, error: 'Database is in Read-Only Mode. Submissions are temporarily disabled.' };
     // Save to Firebase
     try {
       // Create a copy of formData to inject semantic fields
@@ -1292,7 +1309,7 @@ const App: React.FC = () => {
   };
 
   const handleSubmitLeaveRequest = useCallback(async (requestData: any) => {
-    if (checkWritesBlock()) return;
+    if (checkWritesBlock()) return { success: false, error: 'Database is in Read-Only Mode. Submissions are temporarily disabled.' };
     if (!authUser) return;
 
     const processedData = { ...requestData };
@@ -1319,7 +1336,7 @@ const App: React.FC = () => {
   }, [authUser, employeeData, workflowConfigs, notifyApprovers, logSystemAction, refreshGlobalStats, checkWritesBlock]);
 
   const handleSubmitResignationRequest = useCallback(async (requestData: any) => {
-    if (checkWritesBlock()) return;
+    if (checkWritesBlock()) return { success: false, error: 'Database is in Read-Only Mode. Submissions are temporarily disabled.' };
     if (!authUser) return;
 
     const processedData = { ...requestData };
@@ -1410,9 +1427,9 @@ const App: React.FC = () => {
     refreshGlobalStats();
   }, [resignationRequests, authUser, workflowConfigs, roles, logSystemAction, sendNotification, notifyApprovers, refreshGlobalStats, sites, staffUsers]);
 
-  // Automatically relieve employees whose approved notice period has concluded
+  // Automatically relieve employees whose approved notice period has concluded (Super Admin only to prevent permission loops)
   useEffect(() => {
-    if (!authUser || (authUser as any).type !== 'Admin') return;
+    if (!authUser || (authUser as any).type !== 'Admin' || !(authUser as any).isSuperAdmin) return;
     if (resignationRequests && resignationRequests.length > 0) {
       processDueResignations(resignationRequests).catch(err => {
         console.warn('[AutoRelieve] Failed to process due resignations:', err);
@@ -1421,7 +1438,7 @@ const App: React.FC = () => {
   }, [resignationRequests, authUser]);
 
   const handleSubmitAccountUpdateRequest = useCallback(async (requestData: any) => {
-    if (checkWritesBlock()) return;
+    if (checkWritesBlock()) return { success: false, error: 'Database is in Read-Only Mode. Submissions are temporarily disabled.' };
     if (!authUser) return;
 
     const processedData = { ...requestData };
@@ -1753,16 +1770,18 @@ const App: React.FC = () => {
         const { auth } = await import('./src/firebase/config');
         const { GoogleAuthProvider, signInWithPopup } = await import('firebase/auth');
 
-        if (!auth.currentUser) {
+        if (!auth.currentUser && !authUser) {
           throw new Error("You must be signed in with your administrator account to authorize Deep Purge.");
         }
+
+        // Capture current admin active email BEFORE launching popup (UDF-AUD-63)
+        const activeEmail = (auth.currentUser?.email || authUser?.email || '').toLowerCase().trim();
 
         const provider = new GoogleAuthProvider();
         provider.setCustomParameters({ prompt: 'select_account' });
 
         const result = await signInWithPopup(auth, provider);
         const signedInEmail = (result.user.email || '').toLowerCase().trim();
-        const activeEmail = (auth.currentUser.email || authUser?.email || '').toLowerCase().trim();
 
         if (signedInEmail && activeEmail && signedInEmail !== activeEmail) {
           throw new Error(`Account mismatch: Re-authentication used "${signedInEmail}", but current admin session is logged in as "${activeEmail}".`);
@@ -1916,8 +1935,21 @@ const App: React.FC = () => {
 
         // Item 5: If permanently deleting an approved leave, refund the balance back
         if (moduleId === 'LEAVES') {
-          const req = leaveRequests.find(r => r.id === requestId);
-          if (req && req.status === RequestStatus.APPROVED) {
+          let req = leaveRequests.find(r => r.id === requestId);
+          if (!req) {
+            // It might be an approved/rejected leave in historical! Fetch it from Firestore
+            try {
+              const { doc, getDoc } = await import('firebase/firestore');
+              const { db } = await import('./src/firebase/config');
+              const docSnap = await getDoc(doc(db, 'leave_requests', requestId));
+              if (docSnap.exists()) {
+                req = { id: docSnap.id, ...docSnap.data() } as LeaveRequest;
+              }
+            } catch (fetchErr) {
+              console.warn('[handleDeleteWorkflowRequest] Could not fetch leave request for refund:', fetchErr);
+            }
+          }
+          if (req && req.status === RequestStatus.APPROVED && req.startDate && req.endDate) {
             const [sY, sM, sD] = req.startDate.split('-').map(Number);
             const [eY, eM, eD] = req.endDate.split('-').map(Number);
             const daysTaken = Math.round((Date.UTC(eY, eM - 1, eD) - Date.UTC(sY, sM - 1, sD)) / (1000 * 3600 * 24)) + 1;
@@ -2128,13 +2160,17 @@ const App: React.FC = () => {
           if (subData.linkedGoogleEmail) updateData.linkedGoogleEmail = subData.linkedGoogleEmail;
           if (subData.linkedUid) {
             updateData.uid = subData.linkedUid;
-            sourceUid = subData.linkedUid;
           }
         }
 
-        // Migrate files in storage
+        // Migrate files in storage (check both subId and linkedUid)
         const { moveStorageFiles } = await import('./src/services/storageService');
-        await moveStorageFiles(`onboarding/${sourceUid}`, `employees/${employeeId}`);
+        await moveStorageFiles(`onboarding/${subId}`, `employees/${employeeId}`);
+        if (subSnap.exists() && subSnap.data()?.linkedUid && subSnap.data().linkedUid !== subId) {
+          try {
+            await moveStorageFiles(`onboarding/${subSnap.data().linkedUid}`, `employees/${employeeId}`);
+          } catch {}
+        }
 
         // Read active employee record to update dynamic storage paths
         const empSnap = await getDoc(empRef);
@@ -2154,6 +2190,8 @@ const App: React.FC = () => {
                   ...val,
                   storagePath: val.storagePath.replace(oldPrefix, newPrefix)
                 };
+              } else if (typeof val === 'string' && val.includes(oldPrefix)) {
+                newObj[key] = val.replace(oldPrefix, newPrefix);
               } else {
                 newObj[key] = rewriteStoragePaths(val, oldPrefix, newPrefix);
               }
@@ -2236,6 +2274,14 @@ const App: React.FC = () => {
       const baseRole = roles.find(r => r.id === authUser?.roleId);
       if (!baseRole) return undefined;
 
+      // If base role is disabled, staff assigned this role lose all permissions (UDF-AUD-67)
+      if (baseRole.isDisabled === true || (baseRole as any).isActive === false) {
+        return {
+          ...baseRole,
+          permissions: []
+        };
+      }
+
       const overrides = (authUser as any)?.permissionOverrides || {};
       const mergedPermissions = [...(baseRole.permissions || [])];
 
@@ -2311,6 +2357,8 @@ const App: React.FC = () => {
     onRejoinEmployee: handleRejoinEmployee,
     onSyncDrive: handleSyncDrive,
     onUpdateId: handleUpdateSubmissionId,
+    onUpdateSubmissionId: handleUpdateSubmissionId,
+    onRefreshStats: () => refreshGlobalStats(),
     onRevertWorkflowRequest: handleRevertWorkflowRequest,
     onDeleteRequest: handleDeleteWorkflowRequest,
     onDeleteDiscipline: handleDeleteDisciplinaryAction,
@@ -2390,27 +2438,31 @@ const App: React.FC = () => {
 
       await updateDoc(empRef, employeePayload);
 
-      const subId = await findSubmissionIdByEmployeeId(userUniqueId);
-      if (subId) {
-        const subRef = doc(db, 'onboarding_submissions', subId);
+      try {
+        const subId = await findSubmissionIdByEmployeeId(userUniqueId);
+        if (subId) {
+          const subRef = doc(db, 'onboarding_submissions', subId);
 
-        const submissionPayload: any = {
-          lastUpdated: new Date().toISOString()
-        };
+          const submissionPayload: any = {
+            lastUpdated: new Date().toISOString()
+          };
 
-        if (requiresAdminApproval) {
-          submissionPayload.profileStatus = 'waiting_for_admin';
-        } else {
-          submissionPayload.needsProfileCompletion = false;
-          submissionPayload.profileStatus = 'approved';
+          if (requiresAdminApproval) {
+            submissionPayload.profileStatus = 'waiting_for_admin';
+          } else {
+            submissionPayload.needsProfileCompletion = false;
+            submissionPayload.profileStatus = 'approved';
+          }
+
+          if (updatedData) {
+            submissionPayload.formData = { ...employeeData.formData, ...updatedData };
+            submissionPayload.data = { ...employeeData.data, ...updatedData };
+          }
+
+          await updateDoc(subRef, submissionPayload);
         }
-
-        if (updatedData) {
-          submissionPayload.formData = { ...employeeData.formData, ...updatedData };
-          submissionPayload.data = { ...employeeData.data, ...updatedData };
-        }
-
-        await updateDoc(subRef, submissionPayload);
+      } catch (subErr) {
+        console.warn("[handleCompleteProfile] Submissions doc sync bypassed or restricted by rules:", subErr);
       }
 
       if (requiresAdminApproval) {

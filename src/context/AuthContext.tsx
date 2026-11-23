@@ -118,6 +118,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 const { doc, onSnapshot } = await import('firebase/firestore');
 
                 const handleProfileData = async (data: Record<string, any>) => {
+                    // Check if account has been disabled or suspended (UDF-AUD-179)
+                    if (data.isDisabled === true || data.status === 'suspended' || data.status === 'inactive' || data.isActive === false) {
+                        log.warn('AuthContext: Account has been disabled or suspended. Terminating session immediately.');
+                        try {
+                            await auth.signOut();
+                        } catch (_) {}
+                        setUser(null);
+                        window.location.href = '/login';
+                        return;
+                    }
+
                     // Update local user state immediately if role, permissionOverrides, sites, or status changed
                     setUser(prev => {
                         if (!prev) return null;
@@ -138,11 +149,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                         return prev;
                     });
 
-                    // If claims or permissions were updated on server, refresh Firebase Auth JWT token immediately
+                    // If claims, permissions, or site scopes were updated on server, refresh Firebase Auth JWT token immediately
                     // so Firestore backend security rules enforce the new claims on the very next database query
-                    if (data.claimsUpdatedAt || data.permissionOverrides !== undefined || data.roleId !== undefined) {
+                    if (data.claimsUpdatedAt || data.permissionOverrides !== undefined || data.roleId !== undefined || data.sitesManaged !== undefined) {
                         try {
-                            log.log('AuthContext: Detected permissions/claims update, refreshing Firebase Auth JWT token...');
+                            log.log('AuthContext: Detected permissions/claims/sites update, refreshing Firebase Auth JWT token...');
                             await auth.currentUser?.getIdToken(true);
                         } catch (tokenErr) {
                             log.warn('AuthContext: Could not refresh token on claims change:', tokenErr);

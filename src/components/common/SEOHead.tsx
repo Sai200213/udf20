@@ -61,7 +61,8 @@ export const SEOHead: React.FC<SEOHeadProps> = ({
             robotsEl.setAttribute('name', 'robots');
             document.head.appendChild(robotsEl);
         }
-        robotsEl.setAttribute('content', noindex ? 'noindex, nofollow' : 'index, follow');
+        const isPrivatePortal = ['admin', 'employee'].includes(import.meta.env.VITE_APP_TARGET || '');
+        robotsEl.setAttribute('content', (noindex || isPrivatePortal) ? 'noindex, nofollow' : 'index, follow');
 
     }, [title, description, canonicalUrl, ogImage, noindex]);
 

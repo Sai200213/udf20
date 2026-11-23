@@ -23,6 +23,7 @@ const AdminPortalPage = React.lazy(() => import('@/components/AdminPortalPage'))
 const EmployeeDashboardPage = React.lazy(() => import('@/components/EmployeeDashboardPage'));
 const ProfileClaimPage = React.lazy(() => import('@/components/employee/ProfileClaimPage'));
 const DataCorrectionPage = React.lazy(() => import('@/components/employee/DataCorrectionPage'));
+const SetupAccountPage = React.lazy(() => import('@/src/components/auth/SetupAccountPage'));
 
 // Loading spinner for lazy-loaded pages
 const LazyFallback = () => (
@@ -230,6 +231,7 @@ const AppRoutes: React.FC<AppRoutesProps> = (props) => {
                     } />
                     <Route path="/claim-profile" element={<ProfileClaimPage />} />
                     <Route path="/correct-details" element={<DataCorrectionPage sections={props.syncedSections} />} />
+                    <Route path="/setup-account" element={<SetupAccountPage />} />
                     <Route path="/join" element={
                         <EmployeeFormPage
                             sections={props.syncedSections}
@@ -277,6 +279,7 @@ const AppRoutes: React.FC<AppRoutesProps> = (props) => {
                 <Route path="/employee/*" element={<RedirectToExternal url="https://employee.udfonline.in/dashboard" label="Employee Dashboard" />} />
                 <Route path="/claim-profile" element={<RedirectToExternal url="https://employee.udfonline.in/claim-profile" label="Profile Claim" />} />
                 <Route path="/correct-details" element={<RedirectToExternal url="https://employee.udfonline.in/correct-details" label="Data Correction" />} />
+                <Route path="/setup-account" element={<RedirectToExternal url="https://employee.udfonline.in/setup-account" label="Account Setup" />} />
 
                 <Route path="/blogs" element={<BlogsPage />} />
                 <Route path="/blogs/:postId" element={<BlogsPage />} />

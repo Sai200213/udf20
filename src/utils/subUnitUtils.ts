@@ -46,12 +46,22 @@ export const findSubUnit = (sites: Site[], identifier: string): { site: Site, su
 export const buildSubUnitLookupMap = (sites: Site[]): Map<string, { site: Site, subUnit: SubUnit }> => {
     const map = new Map<string, { site: Site, subUnit: SubUnit }>();
     for (const site of sites) {
+        const siteKey = (site.name || '').toLowerCase().trim();
         for (const subUnit of site.subUnits || []) {
+            const subKey = subUnit.name.toLowerCase().trim();
             // Add by name
-            map.set(subUnit.name.toLowerCase().trim(), { site, subUnit });
+            map.set(subKey, { site, subUnit });
+            // Add compounded key site::subunit to prevent silent overwrites on identical subunit names (UDF-AUD-350)
+            if (siteKey) {
+                map.set(`${siteKey}::${subKey}`, { site, subUnit });
+            }
             // Add by code if exists
             if (subUnit.code) {
-                map.set(subUnit.code.toLowerCase().trim(), { site, subUnit });
+                const codeKey = subUnit.code.toLowerCase().trim();
+                map.set(codeKey, { site, subUnit });
+                if (siteKey) {
+                    map.set(`${siteKey}::${codeKey}`, { site, subUnit });
+                }
             }
         }
     }

@@ -6,9 +6,10 @@ interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {
   label?: string;
   error?: string;
   showPasswordToggle?: boolean;
+  icon?: React.ReactNode;
 }
 
-const Input: React.FC<InputProps> = ({ label, id, error, className, type, showPasswordToggle, ...props }) => {
+const Input: React.FC<InputProps> = ({ label, id, error, className, type, showPasswordToggle, icon, ...props }) => {
   const [showPassword, setShowPassword] = useState(false);
 
   const isPasswordType = type === 'password';
@@ -22,10 +23,15 @@ const Input: React.FC<InputProps> = ({ label, id, error, className, type, showPa
         </label>
       )}
       <div className="relative">
+        {icon && (
+          <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-400">
+            {icon}
+          </div>
+        )}
         <input
           id={id}
           type={inputType}
-          className={`block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm normal-case ${error ? 'border-red-500' : ''} ${className || ''} ${isPasswordType && showPasswordToggle ? 'pr-10' : ''}`}
+          className={`block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm normal-case ${error ? 'border-red-500' : ''} ${className || ''} ${icon ? 'pl-10' : ''} ${isPasswordType && showPasswordToggle ? 'pr-10' : ''}`}
           {...props}
         />
         {isPasswordType && showPasswordToggle && (

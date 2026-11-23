@@ -14,21 +14,28 @@ export function isRoleAssignedToSite(
   // 1. Check if the role itself has company-wide scope permission in the Roles & Permissions tab
   if (roles && roles.length > 0) {
     const roleObj = roles.find(r => r.id === roleId);
-    if (roleObj && !roleObj.isDisabled) {
+    if (roleObj) {
+      if (roleObj.isDisabled) {
+        return false;
+      }
       const hasGlobalScope = roleObj.permissions?.includes(Permission.SUBMISSIONS_VIEW_SCOPE_ALL) ||
         roleObj.permissions?.includes(Permission.EMPLOYEES_VIEW_SCOPE_ALL) ||
         roleObj.permissions?.includes(Permission.LEAVES_VIEW_SCOPE_ALL) ||
         roleObj.permissions?.includes(Permission.ACCOUNT_UPDATES_VIEW_SCOPE_ALL) ||
         roleObj.permissions?.includes(Permission.RESIGNATIONS_VIEW_SCOPE_ALL);
       if (hasGlobalScope) {
-        return true;
+        // Must ensure there is at least one active, non-deleted staff user who holds this role (UDF-AUD-145)
+        const hasActiveStaff = staffUsers.some(u => u.roleId === roleId && !u.isDisabled && (u as any).status !== 'Inactive' && !(u as any).deletedAt);
+        if (hasActiveStaff) {
+          return true;
+        }
       }
     }
   }
 
   // 2. Check if any staff user with this role is assigned to this site, OR is an all-sites staff member
   return staffUsers.some(u => {
-    if (u.roleId !== roleId || u.isDisabled) return false;
+    if (u.roleId !== roleId || u.isDisabled || (u as any).status === 'Inactive' || (u as any).deletedAt) return false;
 
     // Explicitly supervising or managing this site (checks single supervisor, multi-supervisors, or staff's sitesManaged)
     if (

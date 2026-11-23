@@ -18,7 +18,11 @@ async function fetchFirestore(path_) {
 }
 
 async function run() {
-  const email = 'arjosarka56r@gmail.com';
+  const email = process.argv[2];
+  if (!email) {
+    console.error('Usage: node scripts/search_user_rest.mjs <email>');
+    process.exit(1);
+  }
   console.log(`Checking Firestore for email: ${email}`);
 
   const collections = ['employees', 'onboarding_submissions', 'users', 'staff_accounts'];

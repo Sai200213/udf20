@@ -4,7 +4,7 @@ import { getEmployeeTimeline, getEmployeeById } from '../../src/services/employe
 import {
     Calendar, CheckCircle, AlertTriangle, FileText,
     UserMinus, UserPlus, ArrowUpCircle, Clock,
-    ChevronRight, ExternalLink
+    ChevronRight, ExternalLink, RotateCcw
 } from 'lucide-react';
 
 interface EmployeeTimelinePageProps {
@@ -19,24 +19,36 @@ const EmployeeTimelinePage: React.FC<EmployeeTimelinePageProps> = ({ employeeId,
     const [employee, setEmployee] = useState<FirestoreEmployee | null>(null);
 
     useEffect(() => {
+        let isCancelled = false;
         const fetchData = async () => {
             setLoading(true);
             try {
                 // Fetch basic details of current ID
                 const empData = await getEmployeeById(employeeId);
-                setEmployee(empData as unknown as FirestoreEmployee);
+                if (!isCancelled) {
+                    setEmployee(empData as unknown as FirestoreEmployee);
+                }
 
                 // Fetch full timeline
                 const timelineEvents = await getEmployeeTimeline(employeeId);
-                setEvents(Array.isArray(timelineEvents) ? timelineEvents : []);
+                if (!isCancelled) {
+                    setEvents(Array.isArray(timelineEvents) ? timelineEvents : []);
+                }
             } catch (err: any) {
-                setError(err.message || "Failed to load timeline.");
+                if (!isCancelled) {
+                    setError(err.message || "Failed to load timeline.");
+                }
             } finally {
-                setLoading(false);
+                if (!isCancelled) {
+                    setLoading(false);
+                }
             }
         };
 
         fetchData();
+        return () => {
+            isCancelled = true;
+        };
     }, [employeeId]);
 
     const getIcon = (type: string) => {
@@ -56,6 +68,7 @@ const EmployeeTimelinePage: React.FC<EmployeeTimelinePageProps> = ({ employeeId,
         switch (type) {
             case 'JOINED': return 'bg-green-100 border-green-200';
             case 'RELIEVED': return 'bg-purple-100 border-purple-200';
+            case 'RESIGNATION': return 'bg-rose-50 border-rose-200';
             case 'LEAVE': return 'bg-blue-50 border-blue-100';
             case 'DISCIPLINE': return 'bg-red-50 border-red-100';
             case 'UPDATE': return 'bg-amber-50 border-amber-100';
@@ -71,14 +84,26 @@ const EmployeeTimelinePage: React.FC<EmployeeTimelinePageProps> = ({ employeeId,
         || (employee as any)?.profileData?.applicantName 
         || (employee as any)?.profileData?.['Applicant Name'] 
         || (employee as any)?.profileData?.['Full Name'] 
+        || (employee as any)?.profileData?.['7debf274-baee-4bac-a137-4b4b46719874']
         || (employee as any)?.data?.['Applicant Name'] 
         || (employee as any)?.data?.['Full Name'] 
+        || (employee as any)?.data?.['7debf274-baee-4bac-a137-4b4b46719874']
         || (employee as any)?.name 
         || 'Employee Record';
 
     const displayId = employee?.employeeId || (employee as any)?.id || employeeId;
-    const displayDesignation = employee?.designation || (employee as any)?.profileData?.designation || (employee as any)?.data?.designation || '';
-    const displaySite = employee?.siteName || (employee as any)?.currentSite || (employee as any)?.siteId || '';
+    const displayDesignation = employee?.designation 
+        || (employee as any)?.profileData?.designation 
+        || (employee as any)?.data?.designation 
+        || (employee as any)?.profileData?.['designation'] 
+        || (employee as any)?.data?.['designation'] 
+        || '';
+    const displaySite = employee?.siteName 
+        || (employee as any)?.currentSiteName 
+        || (employee as any)?.currentSite 
+        || (employee as any)?.siteId 
+        || (employee as any)?.currentSiteId 
+        || '';
 
     return (
         <div className="flex flex-col h-full bg-white rounded-2xl overflow-hidden shadow-xl border border-gray-200">
@@ -139,7 +164,11 @@ const EmployeeTimelinePage: React.FC<EmployeeTimelinePageProps> = ({ employeeId,
 
                             {/* Date Label */}
                             <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest bg-white px-2 py-0.5 rounded border border-slate-100 mb-2 inline-block">
-                                {new Date(event.date).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
+                                {(() => {
+                                    if (!event.date) return 'No Date';
+                                    const d = new Date(event.date);
+                                    return !isNaN(d.getTime()) ? d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : 'Invalid Date';
+                                })()}
                             </span>
 
                             {/* Card */}
@@ -184,8 +213,7 @@ const EmployeeTimelinePage: React.FC<EmployeeTimelinePageProps> = ({ employeeId,
     );
 };
 
-// Helper for icon
-import { RotateCcw } from 'lucide-react';
+
 
 export default EmployeeTimelinePage;
 

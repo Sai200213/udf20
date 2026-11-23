@@ -1,4 +1,5 @@
 import admin from 'firebase-admin';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';

@@ -46,9 +46,13 @@ const SectionItem: React.FC<SectionItemProps> = ({
   sites,
 }) => {
   const [isEditingName, setIsEditingName] = useState(false);
-  const [newName, setNewName] = useState(section.name);
+  const [newName, setNewName] = useState(section.name || (section as any).title || '');
   const [isFieldEditorOpen, setIsFieldEditorOpen] = useState(false);
   const [editingField, setEditingField] = useState<FormField | undefined>(undefined);
+
+  React.useEffect(() => {
+    setNewName(section.name || (section as any).title || '');
+  }, [section.name, (section as any).title]);
 
   const handleNameSave = () => {
     if (newName.trim()) {
@@ -103,7 +107,7 @@ const SectionItem: React.FC<SectionItemProps> = ({
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 onBlur={handleNameSave}
-                onKeyPress={(e) => e.key === 'Enter' && handleNameSave()}
+                onKeyDown={(e) => e.key === 'Enter' && handleNameSave()}
                 autoFocus
                 className="text-xl font-semibold"
               />

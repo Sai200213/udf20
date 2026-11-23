@@ -20,14 +20,14 @@ export interface BlogPost {
 export const getBlogPosts = async (): Promise<BlogPost[]> => {
     try {
         const blogCol = collection(db, 'blog_posts');
-        const isAuth = !!auth?.currentUser;
+        const isAuth = !!auth?.currentUser && !auth.currentUser.isAnonymous;
         
         let q;
         if (isAuth) {
             // Authenticated users (staff/employees) can see all posts (including internal protocols)
             q = query(blogCol, orderBy('timestamp', 'desc'));
         } else {
-            // Public unauthenticated visitors only fetch public posts
+            // Public unauthenticated visitors only fetch public posts (UDF-AUD-48)
             q = query(blogCol, where('isPrivate', '==', false), orderBy('timestamp', 'desc'));
         }
 
@@ -61,8 +61,9 @@ export const getBlogPosts = async (): Promise<BlogPost[]> => {
             } as BlogPost;
         });
 
-        // Ensure descending sort by timestamp/date
+        // Ensure pinned posts come first, then descending sort by timestamp/date
         return posts.sort((a, b) => {
+            if (Boolean(a.isPinned) !== Boolean(b.isPinned)) return a.isPinned ? -1 : 1;
             const timeA = a.timestamp?.toMillis ? a.timestamp.toMillis() : (a.timestamp?.seconds ? a.timestamp.seconds * 1000 : new Date(a.date).getTime() || 0);
             const timeB = b.timestamp?.toMillis ? b.timestamp.toMillis() : (b.timestamp?.seconds ? b.timestamp.seconds * 1000 : new Date(b.date).getTime() || 0);
             return timeB - timeA;
@@ -88,13 +89,13 @@ export const updateBlogPost = async (id: string, updates: Partial<Omit<BlogPost,
     const docRef = doc(db, 'blog_posts', id);
     await updateDoc(docRef, {
         ...updates,
-        timestamp: serverTimestamp(),
+        updatedAt: serverTimestamp(),
     } as any);
     await logSystemAction('UPDATE', 'SYSTEM', `Updated blog post ${id}${updates.title ? ` ("${updates.title}")` : ''}`);
 };
 
 export const deleteBlogPost = async (id: string, imageUrl?: string): Promise<void> => {
-    if (imageUrl) {
+    if (imageUrl && !imageUrl.startsWith('http://') && (!imageUrl.startsWith('https://') || imageUrl.includes('firebasestorage'))) {
         try {
             await deleteStorageFile(imageUrl);
         } catch (err) {

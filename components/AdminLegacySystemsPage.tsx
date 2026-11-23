@@ -252,7 +252,7 @@ const AdminLegacySystemsPage: React.FC<AdminLegacySystemsPageProps> = ({ logActi
         setIsUploading(false);
         // Reset file input
         e.target.value = '';
-    }, [logAction]);
+    }, [logAction, imports]);
 
     const handleDeleteImport = async (id: string) => {
         if (!window.confirm('Remove this legacy record? The employee will no longer be able to claim it.')) return;
@@ -715,6 +715,24 @@ const AdminLegacySystemsPage: React.FC<AdminLegacySystemsPageProps> = ({ logActi
                                         type="text"
                                         value={editFormData.designation || ''}
                                         onChange={e => setEditFormData({ ...editFormData, designation: e.target.value })}
+                                        className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <label className="text-xs font-semibold text-gray-500 uppercase">Father's Name (UDF-AUD-51)</label>
+                                    <input
+                                        type="text"
+                                        value={editFormData.fatherName || ''}
+                                        onChange={e => setEditFormData({ ...editFormData, fatherName: e.target.value })}
+                                        className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <label className="text-xs font-semibold text-gray-500 uppercase">Location / Unit</label>
+                                    <input
+                                        type="text"
+                                        value={editFormData.location || ''}
+                                        onChange={e => setEditFormData({ ...editFormData, location: e.target.value })}
                                         className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-500"
                                     />
                                 </div>

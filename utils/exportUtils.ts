@@ -24,6 +24,22 @@ export const exportEmployeesToCSV = (
         return sensitiveKeywords.some(k => label.toLowerCase().includes(k));
     };
 
+    const sanitizeExcelCell = (val: any): string => {
+        if (val === undefined || val === null) return '';
+        if (typeof val === 'object') {
+            // Extract file URL or storage path instead of printing "[object Object]"
+            val = val.url || val.storagePath || val.driveUrl || val.name || '';
+        }
+        let strVal = String(val);
+        // SECURITY: Prevent CSV/Excel Formula Injection (CWE-1236)
+        // If the cell value begins with =, +, -, @, \t, or \r, spreadsheet apps execute it as a formula.
+        // Prefixing with a single quote (') tells Excel to treat it strictly as literal text.
+        if (/^[=+\-@\t\r]/.test(strVal)) {
+            strVal = `'${strVal}`;
+        }
+        return strVal;
+    };
+
     // 1. Prepare Headers
     const headers: string[] = [];
     const dynamicFields: { id: string; label: string }[] = [];
@@ -47,7 +63,11 @@ export const exportEmployeesToCSV = (
 
     // 2. Prepare Raw Rows for Excel (preserves raw strings with leading zeros)
     const rawRows: string[][] = employees.map(emp => {
-        const data = emp.data || {};
+        const data = {
+            ...(emp.data || {}),
+            ...((emp as any).formData || {}),
+            ...((emp as any).profileData || {})
+        };
         const name = emp.applicantName || getApplicantName(data, sections) || 'N/A';
         const status = (emp as any).isActive ? 'Active' : 'Inactive';
         const site = (emp as any).siteName || 'N/A';
@@ -55,11 +75,11 @@ export const exportEmployeesToCSV = (
 
         const row: string[] = [];
 
-        if (isVisible('employeeId')) row.push(String(emp.employeeId || 'N/A'));
-        if (isVisible('name')) row.push(String(name));
-        if (isVisible('status')) row.push(status);
-        row.push(String(site));
-        if (isVisible('joiningDate')) row.push(joinDate);
+        if (isVisible('employeeId')) row.push(sanitizeExcelCell(emp.employeeId || 'N/A'));
+        if (isVisible('name')) row.push(sanitizeExcelCell(name));
+        if (isVisible('status')) row.push(sanitizeExcelCell(status));
+        row.push(sanitizeExcelCell(site));
+        if (isVisible('joiningDate')) row.push(sanitizeExcelCell(joinDate));
 
         // Add dynamic field values
         dynamicFields.forEach(field => {
@@ -68,12 +88,9 @@ export const exportEmployeesToCSV = (
             // SECURITY: Mask sensitive data on export if permission is missing
             if (isSensitiveField(field.label) && !canViewSensitive) {
                 val = '••••••••';
-            } else if (val === undefined || val === null) {
-                val = '';
             }
 
-            // Keep raw string format to preserve leading zeros (e.g., bank accounts "00123...")
-            row.push(String(val));
+            row.push(sanitizeExcelCell(val));
         });
 
         return row;

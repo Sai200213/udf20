@@ -9,7 +9,7 @@ import {
   CheckCircle, XCircle, Search, Filter, ArrowLeftRight, Building, CheckSquare, 
   Square, X, RefreshCw, ShieldCheck, Users, MapPin, Plus
 } from 'lucide-react';
-import { createStaffUser, deleteStaffUser, setStaffUserStatus, resetStaffUserPassword } from '../src/services/staffService';
+import { createStaffUser, deleteStaffUser, setStaffUserStatus, resetStaffUserPassword, refreshStaffClaims } from '../src/services/staffService';
 import { auth } from '../src/firebase/config';
 import { sendPasswordResetEmail } from 'firebase/auth';
 import { db } from '../src/firebase/config';
@@ -111,6 +111,7 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
     const directSites = Array.isArray(staff.sitesManaged) ? staff.sitesManaged.filter(Boolean) : [];
     const supervisedSites = (sites || [])
       .filter(s => {
+        if (s.status !== 'Active' || (s as any).deletedAt) return false;
         if (s.supervisorId === staff.id) return true;
         if (Array.isArray(s.supervisorIds) && s.supervisorIds.includes(staff.id)) return true;
         return false;
@@ -122,7 +123,7 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
   // Helper: Get site objects assigned to a staff user
   const getStaffAssignedSites = (staff: StaffUser): Site[] => {
     const assignedIds = getStaffAssignedSiteIds(staff);
-    return (sites || []).filter(s => assignedIds.includes(s.id));
+    return (sites || []).filter(s => assignedIds.includes(s.id) && s.status === 'Active' && !(s as any).deletedAt);
   };
 
   // Top Operational Metrics
@@ -241,6 +242,10 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
       onNotify("Please fill in all required fields", "error");
       return;
     }
+    if (password.length < 8) {
+      onNotify("Password must be at least 8 characters long", "error");
+      return;
+    }
 
     setIsLoading(true);
     try {
@@ -260,6 +265,7 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
           });
           await syncStaffSitesToDatabase(result.uid, createSelectedSites);
         }
+        await refreshStaffClaims(result.uid);
 
         // Update local state
         const newStaffUser: StaffUser = {
@@ -323,6 +329,7 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
 
         // Synchronize site supervisors in settings/sites
         await syncStaffSitesToDatabase(editingStaff.id, sitesToSave);
+        await refreshStaffClaims(editingStaff.id);
 
         setStaffUsers(prev => prev.map(s => s.id === editingStaff.id ? { ...editingStaff, sitesManaged: sitesToSave } : s));
         onNotify("Staff account and site assignments updated.", 'success');
@@ -365,6 +372,7 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
         const keptIds = getStaffAssignedSiteIds(staff);
         await syncStaffSitesToDatabase(staff.id, keptIds);
       }
+      await refreshStaffClaims(staff.id);
 
       setStaffUsers(prev => prev.map(s =>
         s.id === staff.id
@@ -443,6 +451,10 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
     }
     const targetStaff = staffUsers.find(s => s.id === transferTargetStaffId);
     if (!targetStaff) return;
+    if (targetStaff.id === transferSourceStaff.id) {
+      onNotify("Cannot transfer sites to the same staff member.", "error");
+      return;
+    }
 
     setIsTransferring(true);
     try {
@@ -508,6 +520,11 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
         }
         return s;
       }));
+
+      await refreshStaffClaims(targetStaff.id);
+      if (transferMode === 'REPLACE') {
+        await refreshStaffClaims(transferSourceStaff.id);
+      }
 
       const modeLabel = transferMode === 'REPLACE' ? 'reassigned exclusively' : 'shared as co-supervisor';
       onNotify(`Successfully transferred ${sourceSiteIds.length} site(s) from ${transferSourceStaff.name} to ${targetStaff.name} (${modeLabel}).`, 'success');
@@ -604,55 +621,57 @@ const AdminStaffManagementPage: React.FC<AdminStaffManagementPageProps> = ({
         });
       }
 
-      // 2. Safely unassign links so sites and employees are NEVER destroyed
-      if (deleteLinks.sites.length > 0) {
-        try {
-          const sitesDocRef = doc(db, SETTINGS_COLLECTION, 'sites');
-          const sitesSnap = await getDoc(sitesDocRef);
-          if (sitesSnap.exists()) {
-            const allSites: Site[] = sitesSnap.data().sites || [];
-            const updated = allSites.map(site => {
-              let sSupervisorIds = Array.isArray(site.supervisorIds) ? site.supervisorIds.filter(id => id !== staffToDelete) : [];
-              let sSupervisorId = site.supervisorId === staffToDelete ? (sSupervisorIds[0] || '') : site.supervisorId;
-              return {
-                ...site,
-                supervisorId: sSupervisorId,
-                supervisorIds: sSupervisorIds
-              };
-            });
-            await updateDoc(sitesDocRef, { sites: updated });
-            if (setSites) setSites(updated);
+      // 2. Safely unassign links ONLY if mode is 'clean-links' (UDF-AUD-66)
+      if (mode === 'clean-links') {
+        if (deleteLinks.sites.length > 0) {
+          try {
+            const sitesDocRef = doc(db, SETTINGS_COLLECTION, 'sites');
+            const sitesSnap = await getDoc(sitesDocRef);
+            if (sitesSnap.exists()) {
+              const allSites: Site[] = sitesSnap.data().sites || [];
+              const updated = allSites.map(site => {
+                let sSupervisorIds = Array.isArray(site.supervisorIds) ? site.supervisorIds.filter(id => id !== staffToDelete) : [];
+                let sSupervisorId = site.supervisorId === staffToDelete ? (sSupervisorIds[0] || '') : site.supervisorId;
+                return {
+                  ...site,
+                  supervisorId: sSupervisorId,
+                  supervisorIds: sSupervisorIds
+                };
+              });
+              await updateDoc(sitesDocRef, { sites: updated });
+              if (setSites) setSites(updated);
+            }
+          } catch (e) {
+            console.warn('Could not clean site supervisor links:', e);
           }
-        } catch (e) {
-          console.warn('Could not clean site supervisor links:', e);
         }
-      }
 
-      if (deleteLinks.employees.length > 0) {
-        try {
-          const empQ = query(collection(db, 'employees'), where('supervisorId', '==', staffToDelete));
-          const empSnap = await getDocs(empQ);
-          const batch = writeBatch(db);
-          empSnap.forEach(d => {
-            batch.update(d.ref, { supervisorId: '' });
-          });
-          await batch.commit();
-        } catch (e) {
-          console.warn('Could not clean employee supervisor links:', e);
+        if (deleteLinks.employees.length > 0) {
+          try {
+            const empQ = query(collection(db, 'employees'), where('supervisorId', '==', staffToDelete));
+            const empSnap = await getDocs(empQ);
+            const batch = writeBatch(db);
+            empSnap.forEach(d => {
+              batch.update(d.ref, { supervisorId: '' });
+            });
+            await batch.commit();
+          } catch (e) {
+            console.warn('Could not clean employee supervisor links:', e);
+          }
         }
-      }
 
-      if (deleteLinks.submissions.length > 0) {
-        try {
-          const subQ = query(collection(db, 'onboarding_submissions'), where('assignedStaffId', '==', staffToDelete));
-          const subSnap = await getDocs(subQ);
-          const batch = writeBatch(db);
-          subSnap.forEach(d => {
-            batch.update(d.ref, { assignedStaffId: '' });
-          });
-          await batch.commit();
-        } catch (e) {
-          console.warn('Could not clean onboarding submissions links:', e);
+        if (deleteLinks.submissions.length > 0) {
+          try {
+            const subQ = query(collection(db, 'onboarding_submissions'), where('assignedStaffId', '==', staffToDelete));
+            const subSnap = await getDocs(subQ);
+            const batch = writeBatch(db);
+            subSnap.forEach(d => {
+              batch.update(d.ref, { assignedStaffId: '' });
+            });
+            await batch.commit();
+          } catch (e) {
+            console.warn('Could not clean onboarding submissions links:', e);
+          }
         }
       }
 

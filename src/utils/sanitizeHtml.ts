@@ -16,7 +16,7 @@ const ALLOWED_ATTRS = new Set([
   'width', 'height', 'frameborder', 'allow', 'allowfullscreen', 'colspan', 'rowspan'
 ]);
 
-const SAFE_URL_PATTERN = /^(https?:\/\/|\/|#|mailto:|tel:)/i;
+const SAFE_URL_PATTERN = /^(https?:\/\/|\/(?!\/)|#|mailto:|tel:)/i;
 
 const SAFE_IFRAME_SRC = /^https:\/\/(www\.)?(youtube\.com\/embed\/|youtube-nocookie\.com\/embed\/|player\.vimeo\.com\/video\/)/i;
 
@@ -26,8 +26,12 @@ export const sanitizeHtml = (html: string): string => {
   if (typeof DOMParser === 'undefined') {
     // Fallback for non-DOM / Node environment
     return html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+               .replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, '')
+               .replace(/<object\b[^<]*(?:(?!<\/object>)<[^<]*)*<\/object>/gi, '')
+               .replace(/<embed\b[^<]*(?:(?!<\/embed>)<[^<]*)*<\/embed>/gi, '')
+               .replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, '')
                .replace(/\bon[a-z]+\s*=\s*(['"][^'"]*['"]|[^\s>]+)/gi, '')
-               .replace(/\bhref\s*=\s*(['"]\s*javascript:[^'"]*['"]|javascript:[^\s>]+)/gi, '');
+               .replace(/\b(href|src)\s*=\s*(['"]\s*javascript:[^'"]*['"]|javascript:[^\s>]+)/gi, '');
   }
 
   const parser = new DOMParser();

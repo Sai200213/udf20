@@ -11,7 +11,7 @@ interface AdminAuditLogPageProps {
 }
 
 const AdminAuditLogPage: React.FC<AdminAuditLogPageProps> = ({ userRole, isSuperAdmin }) => {
-    const { authUser } = useAuth();
+    const { user } = useAuth();
     const [searchTerm, setSearchTerm] = useState('');
     const [filterModule, setFilterModule] = useState<string>('ALL');
     const [filterAction, setFilterAction] = useState<string>('ALL');
@@ -91,8 +91,9 @@ const AdminAuditLogPage: React.FC<AdminAuditLogPageProps> = ({ userRole, isSuper
             userRole?.permissions.includes(Permission.MANAGE_SYSTEM) ||
             userRole?.permissions.includes(Permission.VIEW_AUDIT_LOGS);
 
-        if (!hasFullAccess && authUser?.uid) {
-            filter = { actorId: authUser.uid };
+        const currentUid = user?.id || (user as any)?.uid || (user as any)?.portalId;
+        if (!hasFullAccess && currentUid) {
+            filter = { actorId: currentUid };
         }
 
         log.log("Audit Log Subscription - Has Full Access:", hasFullAccess, "Filter:", filter);
@@ -102,15 +103,23 @@ const AdminAuditLogPage: React.FC<AdminAuditLogPageProps> = ({ userRole, isSuper
             setIsLoading(false);
         }, 100, filter);
         return () => unsubscribe();
-    }, [authUser, userRole, isSuperAdmin]);
+    }, [user, userRole, isSuperAdmin]);
 
     const filteredLogs = useMemo(() => {
         return auditLogs.filter(entry => {
+            const detailsText = String(entry.details || (entry as any).description || '');
+            const actorText = String(entry.actorName || (entry as any).performedBy || (entry as any).actorEmail || 'System');
+            const moduleText = String(entry.targetModule || (entry as any).module || (entry as any).category || 'SYSTEM');
+            const actionText = String(entry.actionType || (entry as any).action || 'LOG');
+
+            const searchLower = searchTerm.toLowerCase();
             const matchesSearch =
-                entry.details.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                entry.actorName.toLowerCase().includes(searchTerm.toLowerCase());
-            const matchesModule = filterModule === 'ALL' || entry.targetModule === filterModule;
-            const matchesAction = filterAction === 'ALL' || entry.actionType === filterAction;
+                detailsText.toLowerCase().includes(searchLower) ||
+                actorText.toLowerCase().includes(searchLower) ||
+                moduleText.toLowerCase().includes(searchLower) ||
+                actionText.toLowerCase().includes(searchLower);
+            const matchesModule = filterModule === 'ALL' || moduleText.toUpperCase() === filterModule.toUpperCase();
+            const matchesAction = filterAction === 'ALL' || actionText.toUpperCase() === filterAction.toUpperCase();
             return matchesSearch && matchesModule && matchesAction;
         });
     }, [auditLogs, searchTerm, filterModule, filterAction]);
@@ -210,15 +219,15 @@ const AdminAuditLogPage: React.FC<AdminAuditLogPageProps> = ({ userRole, isSuper
                                         {new Date(entry.timestamp).toLocaleString()}
                                     </td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                                        {entry.actorName}
+                                        {entry.actorName || (entry as any).performedBy || (entry as any).actorEmail || 'System'}
                                     </td>
                                     <td className="px-6 py-4 whitespace-nowrap">
-                                        <span className={`px-2 py-1 text-xs font-bold rounded border ${getActionColor(entry.actionType)}`}>
-                                            {entry.actionType}
+                                        <span className={`px-2 py-1 text-xs font-bold rounded border ${getActionColor(entry.actionType || (entry as any).action)}`}>
+                                            {entry.actionType || (entry as any).action || 'LOG'}
                                         </span>
                                     </td>
                                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                        {entry.targetModule}
+                                        {entry.targetModule || (entry as any).module || (entry as any).category || 'SYSTEM'}
                                     </td>
                                     <td className="px-6 py-4 text-sm text-gray-700">
                                         {privilegeMode && editingId === entry.id ? (
@@ -230,7 +239,7 @@ const AdminAuditLogPage: React.FC<AdminAuditLogPageProps> = ({ userRole, isSuper
                                             />
                                         ) : (
                                             <span className={entry._edited ? 'italic text-gray-400' : ''}>
-                                                {entry.details}
+                                                {entry.details || (entry as any).description || '—'}
                                                 {entry._edited && <span className="ml-1 text-xs text-gray-400">(edited)</span>}
                                             </span>
                                         )}

@@ -1,7 +1,7 @@
 import log from "@/src/utils/logger";
 
 import { db } from '../firebase/config';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc, runTransaction } from 'firebase/firestore';
 import { Site } from '../../types';
 import { logSystemAction } from './auditService';
 
@@ -24,7 +24,7 @@ const stripUndefined = (obj: any): any => {
 };
 
 /**
- * Updates specific details for a single site within the 'sites' setting document.
+ * Updates specific details for a single site within the 'sites' setting document atomically via transaction (UDF-AUD-308).
  */
 export const updateSiteDetails = async (
     siteId: string,
@@ -33,21 +33,25 @@ export const updateSiteDetails = async (
     const sitesRef = doc(db, SETTINGS_COLLECTION, SITES_DOC_ID);
 
     try {
-        const snap = await getDoc(sitesRef);
-        if (!snap.exists()) throw new Error("Sites configuration not found");
+        let updatedSiteName = siteId;
+        await runTransaction(db, async (tx) => {
+            const snap = await tx.get(sitesRef);
+            if (!snap.exists()) throw new Error("Sites configuration not found");
 
-        const currentSites = snap.data().sites as Site[];
-        const siteIndex = currentSites.findIndex(s => s.id === siteId);
+            const currentSites = (snap.data().sites as Site[]) || [];
+            const siteIndex = currentSites.findIndex(s => s.id === siteId);
 
-        if (siteIndex === -1) throw new Error("Site not found");
+            if (siteIndex === -1) throw new Error("Site not found");
 
-        const updatedSite = { ...currentSites[siteIndex], ...updates };
-        const newSites = [...currentSites];
-        newSites[siteIndex] = updatedSite;
+            const updatedSite = { ...currentSites[siteIndex], ...updates };
+            updatedSiteName = updatedSite.name || siteId;
+            const newSites = [...currentSites];
+            newSites[siteIndex] = updatedSite;
 
-        await setDoc(sitesRef, { sites: stripUndefined(newSites) }, { merge: true });
+            tx.set(sitesRef, { sites: stripUndefined(newSites) }, { merge: true });
+        });
         log.log(`Updated site details for ${siteId}`);
-        await logSystemAction('UPDATE', 'SITES', `Updated site details for "${updatedSite.name}" (${siteId})`);
+        await logSystemAction('UPDATE', 'SITES', `Updated site details for "${updatedSiteName}" (${siteId})`);
 
     } catch (error) {
         console.error("Error updating site details:", error);

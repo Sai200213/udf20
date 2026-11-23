@@ -16,7 +16,7 @@ if (typeof window !== 'undefined') {
   if (h && (h.includes('.web.app') || h.includes('.firebaseapp.com'))) {
     let target = 'udfonline.in';
     if (h.includes('-admin')) target = 'admin.udfonline.in';
-    else if (h.includes('-employee')) target = 'employee.udfonline.in';
+    else if (h.includes('-employee') || h.includes('-emp')) target = 'employee.udfonline.in';
     window.location.replace(`https://${target}${window.location.pathname}${window.location.search}${window.location.hash}`);
   }
 }
@@ -151,19 +151,31 @@ if (typeof window !== 'undefined') {
               <span className="text-sm font-semibold text-slate-900">New portal update available!</span>
               <span className="text-xs text-slate-500">Save your progress, then click to refresh.</span>
             </div>
-            <button
-              onClick={() => {
-                toast.dismiss(t.id);
-                isUpdateReloading = true;
-                try {
-                  sessionStorage.setItem('udf_post_update_version', newVersionLabel);
-                } catch (_) {}
-                window.location.reload();
-              }}
-              className="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3.5 py-2 rounded-lg font-bold shadow-md transition-all cursor-pointer whitespace-nowrap active:scale-95"
-            >
-              Update Now
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  toast.dismiss(t.id);
+                  (window as any).__UDF_UPDATE_PENDING = false;
+                }}
+                className="text-slate-400 hover:text-slate-600 text-xs px-2 py-1 rounded cursor-pointer"
+              >
+                Later
+              </button>
+              <button
+                onClick={() => {
+                  toast.dismiss(t.id);
+                  (window as any).__UDF_UPDATE_PENDING = false;
+                  isUpdateReloading = true;
+                  try {
+                    sessionStorage.setItem('udf_post_update_version', newVersionLabel);
+                  } catch (_) {}
+                  window.location.reload();
+                }}
+                className="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3.5 py-2 rounded-lg font-bold shadow-md transition-all cursor-pointer whitespace-nowrap active:scale-95"
+              >
+                Update Now
+              </button>
+            </div>
           </div>
         ),
         { duration: Infinity, position: 'top-right', id: 'update-available-prompt' }
@@ -198,7 +210,10 @@ if (typeof window !== 'undefined') {
           reg.update().catch(() => {});
         }
       });
-      setInterval(() => reg.update().catch(() => {}), 15 * 60 * 1000);
+      setInterval(() => {
+        if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+        reg.update().catch(() => {});
+      }, 15 * 60 * 1000);
     }).catch(() => {});
   }
 
@@ -207,6 +222,7 @@ if (typeof window !== 'undefined') {
   // captured on this page's first probe, NEVER against client Date.now().
   // PROBLEM 3 FIX: Uses resilientFetch with single-retry backoff for mobile resilience.
   const checkVersionProbe = async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
     try {
       const res = await resilientFetch(`/version.json?_t=${Date.now()}`, { cache: 'no-store' });
       if (!res.ok) return;

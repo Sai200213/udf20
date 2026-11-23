@@ -4,7 +4,7 @@ import { Notification, UserType } from '../../types';
 import { AppView } from '../../App';
 import { db, functions } from '../firebase/config';
 import { httpsCallable } from 'firebase/functions';
-import { collection, doc, query, where, limit, onSnapshot, setDoc, updateDoc, writeBatch, serverTimestamp } from 'firebase/firestore';
+import { collection, doc, query, where, limit, onSnapshot, setDoc, updateDoc, writeBatch, serverTimestamp, arrayUnion } from 'firebase/firestore';
 import { useAuth } from '../context/AuthContext';
 
 interface NotificationContextType {
@@ -23,19 +23,26 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
 
     // Listen for real-time notifications from Firestore for the logged-in user
     useEffect(() => {
-        if (!user || !user.id) {
+        if (!user || !user.id || (user as any).roleId === 'guest' || (user as any).roleId === 'candidate') {
             setNotifications([]);
             return;
         }
 
+        const isVendor = (user as any).isBgvVendor || (user as any).roleId === 'role-bgv-vendor' || (user as any).roleId === 'bgv-vendor';
         const targetIds = [user.id];
-        if (user.type === UserType.ADMIN || user.isSuperAdmin || (user.type as string) === 'Staff' || (user as any).roleId) {
+        const isStaffOrAdmin = !isVendor && (user.type === UserType.ADMIN || user.isSuperAdmin || (user.type as string) === 'Staff');
+        if (isStaffOrAdmin) {
             targetIds.push('all_admins', 'admin');
         }
-        if ((user as any).roleId) {
+        if ((user as any).roleId && (user as any).roleId !== 'guest' && (user as any).roleId !== 'candidate') {
             const roleTarget = `ROLE:${(user as any).roleId}`;
             if (!targetIds.includes(roleTarget)) {
                 targetIds.push(roleTarget);
+            }
+        }
+        if (user.type === UserType.EMPLOYEE || (user as any).isEmployee) {
+            if (!targetIds.includes('ROLE:employee')) {
+                targetIds.push('ROLE:employee');
             }
         }
         if (user.employeeId && !targetIds.includes(user.employeeId)) {
@@ -61,12 +68,19 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
             const unsub = onSnapshot(q, (snapshot) => {
                 snapshot.forEach((docSnap) => {
                     const data = docSnap.data();
+                    const readByList: string[] = Array.isArray(data.readBy) ? data.readBy : [];
+                    const isRead = Boolean(data.read) || 
+                        (readByList.includes(user.id)) ||
+                        Boolean(user.employeeId && readByList.includes(user.employeeId)) ||
+                        Boolean(user.portalId && readByList.includes(user.portalId));
+
                     notifMap.set(docSnap.id, {
                         id: docSnap.id,
                         targetUserId: data.targetUserId,
                         type: data.type || 'info',
                         message: data.message || '',
-                        read: Boolean(data.read),
+                        read: isRead,
+                        readBy: readByList,
                         timestamp: data.timestamp || new Date().toISOString(),
                         link: data.link
                     });
@@ -115,6 +129,7 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
             targetUserId === user?.employeeId || 
             targetUserId === user?.portalId || 
             (targetUserId === 'all_admins' && (user?.type === UserType.ADMIN || user?.isSuperAdmin || (user?.type as string) === 'Staff')) ||
+            (targetUserId === 'ROLE:employee' && (user?.type === UserType.EMPLOYEE || (user as any)?.isEmployee)) ||
             (targetUserId === `ROLE:${(user as any)?.roleId}`);
 
         if (isSelfOrBroadcast) {
@@ -143,20 +158,40 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
             }
         }
 
-    }, []);
+    }, [user]);
 
     const markNotificationAsRead = useCallback(async (id: string) => {
         setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
         try {
-            await updateDoc(doc(db, 'notifications', id), { read: true });
+            const notif = notifications.find(n => n.id === id);
+            const isBroadcast = notif && (notif.targetUserId === 'all_admins' || notif.targetUserId === 'admin' || notif.targetUserId.startsWith('ROLE:'));
+            if (isBroadcast && user?.id) {
+                await updateDoc(doc(db, 'notifications', id), {
+                    readBy: arrayUnion(user.id)
+                });
+            } else {
+                await updateDoc(doc(db, 'notifications', id), {
+                    read: true,
+                    ...(user?.id ? { readBy: arrayUnion(user.id) } : {})
+                });
+            }
         } catch (err) {
             console.warn("Failed to mark notification read in Firestore:", err);
         }
-    }, []);
+    }, [notifications, user?.id]);
 
     const markAllNotificationsAsRead = useCallback(async (userId: string) => {
+        const myTargets = new Set<string>([userId]);
+        if (user?.employeeId) myTargets.add(user.employeeId);
+        if (user?.portalId) myTargets.add(user.portalId);
+        const isVendor = (user as any)?.isBgvVendor || (user as any)?.roleId === 'role-bgv-vendor' || (user as any)?.roleId === 'bgv-vendor';
+        if (!isVendor && (user?.type === UserType.ADMIN || user?.isSuperAdmin)) {
+            myTargets.add('all_admins');
+            myTargets.add('admin');
+        }
+
         setNotifications(prev => prev.map(n => {
-            if (n.targetUserId === userId || n.targetUserId === 'all_admins' || n.targetUserId === 'admin') {
+            if (myTargets.has(n.targetUserId)) {
                 return { ...n, read: true };
             }
             return n;
@@ -164,15 +199,25 @@ export const NotificationProvider: React.FC<{ children: ReactNode }> = ({ childr
 
         try {
             const batch = writeBatch(db);
-            const unread = notifications.filter(n => !n.read && (n.targetUserId === userId || n.targetUserId === 'all_admins' || n.targetUserId === 'admin'));
+            const unread = notifications.filter(n => !n.read && myTargets.has(n.targetUserId));
             unread.slice(0, 50).forEach(n => {
-                batch.update(doc(db, 'notifications', n.id), { read: true });
+                const isBroadcast = n.targetUserId === 'all_admins' || n.targetUserId === 'admin' || n.targetUserId.startsWith('ROLE:');
+                if (isBroadcast && user?.id) {
+                    batch.update(doc(db, 'notifications', n.id), {
+                        readBy: arrayUnion(user.id)
+                    });
+                } else {
+                    batch.update(doc(db, 'notifications', n.id), {
+                        read: true,
+                        ...(user?.id ? { readBy: arrayUnion(user.id) } : {})
+                    });
+                }
             });
             await batch.commit();
         } catch (err) {
             console.warn("Failed to batch update notifications in Firestore:", err);
         }
-    }, [notifications]);
+    }, [notifications, user]);
 
     const value: NotificationContextType = {
         notifications,

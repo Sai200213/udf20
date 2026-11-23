@@ -56,31 +56,51 @@ export const getEmployeeProfile = async (firebaseUser: FirebaseUser): Promise<Us
             empDocId = employeeDoc.id;
         }
 
-        // 2. Fallback: Query by 'uid' field (for records stored under Employee ID)
+        // 2. Fallback: Query by 'uid' or 'linkedUid' field (for records stored under Employee ID)
         if (!empData) {
             const uidQuery = query(collection(db, 'employees'), where("uid", "==", firebaseUser.uid), limit(1));
             const uidSnap = await getDocs(uidQuery);
             if (!uidSnap.empty) {
                 empData = uidSnap.docs[0].data();
                 empDocId = uidSnap.docs[0].id;
+            } else {
+                try {
+                    const linkedUidQuery = query(collection(db, 'employees'), where("linkedUid", "==", firebaseUser.uid), limit(1));
+                    const linkedUidSnap = await getDocs(linkedUidQuery);
+                    if (!linkedUidSnap.empty) {
+                        empData = linkedUidSnap.docs[0].data();
+                        empDocId = linkedUidSnap.docs[0].id;
+                    }
+                } catch (lErr) {
+                    log.debug('[authService] linkedUid lookup error:', lErr);
+                }
             }
         }
 
         // 3. Fallback: Query by linkedGoogleEmail (for Google Sign-in users)
         if (!empData && firebaseUser.email) {
             try {
-                const emailQuery = query(collection(db, 'employees'), where("linkedGoogleEmail", "==", firebaseUser.email), limit(1));
+                const emailQuery = query(collection(db, 'employees'), where("linkedGoogleEmail", "==", firebaseUser.email.toLowerCase().trim()), limit(1));
                 const emailSnap = await getDocs(emailQuery);
                 if (!emailSnap.empty) {
-                    empData = emailSnap.docs[0].data();
-                    empDocId = emailSnap.docs[0].id;
-                    // Update the uid field to the current Firebase UID for future lookups
-                    try {
-                        const { updateDoc: fbUpdateDoc } = await import('firebase/firestore');
-                        await fbUpdateDoc(emailSnap.docs[0].ref, { uid: firebaseUser.uid });
-                        log.log(`[authService] Updated uid field for employee ${empDocId} to match current login`);
-                    } catch (e) {
-                        log.warn('[authService] Could not update uid field:', e);
+                    const candidateData = emailSnap.docs[0].data();
+                    const isCandidateBlocked = candidateData.isRelieved === true ||
+                        candidateData.isActive === false ||
+                        candidateData.status === 'Relieved' ||
+                        candidateData.status === 'relieved' ||
+                        candidateData.status === 'terminated';
+                    
+                    if (!isCandidateBlocked) {
+                        empData = candidateData;
+                        empDocId = emailSnap.docs[0].id;
+                        // Update the uid field to the current Firebase UID for future lookups
+                        try {
+                            const { updateDoc: fbUpdateDoc } = await import('firebase/firestore');
+                            await fbUpdateDoc(emailSnap.docs[0].ref, { uid: firebaseUser.uid });
+                            log.log(`[authService] Updated uid field for employee ${empDocId} to match current login`);
+                        } catch (e) {
+                            log.warn('[authService] Could not update uid field:', e);
+                        }
                     }
                 }
             } catch (err) {
@@ -197,7 +217,7 @@ export const getStaffProfile = async (firebaseUser: FirebaseUser): Promise<User 
 
             // 2. Try by Email
             if (firebaseUser.email) {
-                const q = query(collection(db, collName), where("email", "==", firebaseUser.email), limit(1));
+                const q = query(collection(db, collName), where("email", "==", firebaseUser.email.toLowerCase().trim()), limit(1));
                 const qSnap = await getDocs(q);
                 if (!qSnap.empty) {
                     const data = qSnap.docs[0].data();
@@ -259,7 +279,7 @@ export const getAdminProfile = async (firebaseUser: FirebaseUser): Promise<User 
             await stampAdminClaims(firebaseUser);
             return {
                 type: UserType.ADMIN,
-                id: data.username || firebaseUser.uid,
+                id: firebaseUser.uid,
                 name: data.name || data.displayName || 'Admin',
                 roleId: data.roleId,
                 permissionOverrides: data.permissionOverrides || {}
@@ -267,7 +287,7 @@ export const getAdminProfile = async (firebaseUser: FirebaseUser): Promise<User 
         }
 
         if (firebaseUser.email) {
-            const q = query(collection(db, 'users'), where("email", "==", firebaseUser.email), limit(1));
+            const q = query(collection(db, 'users'), where("email", "==", firebaseUser.email.toLowerCase().trim()), limit(1));
             const qSnap = await getDocs(q);
             if (!qSnap.empty) {
                 const data = qSnap.docs[0].data();
@@ -278,7 +298,7 @@ export const getAdminProfile = async (firebaseUser: FirebaseUser): Promise<User 
                 await stampAdminClaims(firebaseUser);
                 return {
                     type: UserType.ADMIN,
-                    id: data.username || qSnap.docs[0].id,
+                    id: firebaseUser.uid,
                     name: data.name || 'Admin',
                     roleId: data.roleId,
                     permissionOverrides: data.permissionOverrides || {}
@@ -312,10 +332,7 @@ export const checkEmailUniquenessGlobal = async (email: string, options: { exclu
         return unique;
     } catch (e) {
         log.warn("Global email uniqueness check service error:", e);
-        // SAFETY: If the uniqueness check fails due to function error, network issue, or missing field,
-        // we MUST NOT falsely claim the user's email is already registered and block submission.
-        // Fail open and allow submission to proceed.
-        return true;
+        throw new Error('Unable to verify email uniqueness right now. Please try again.');
     }
 };
 
@@ -341,11 +358,8 @@ export const loginUser = async (userInput: string, password: string): Promise<Us
         }
 
         const userCredential = await signInWithEmailAndPassword(auth, loginEmail, password);
-        return {
-            type: UserType.EMPLOYEE,
-            id: userCredential.user.uid,
-            name: userCredential.user.displayName || 'User'
-        };
+        const admin = await getAdminProfile(userCredential.user) || await getStaffProfile(userCredential.user);
+        return admin || await getEmployeeProfile(userCredential.user);
     } catch (error) {
         log.error("Login error:", error);
         throw error;
@@ -397,6 +411,9 @@ export const loginAnonymously = async () => {
 
 export const logoutUser = async () => {
     localStorage.removeItem('portalType');
+    try {
+        sessionStorage.clear();
+    } catch {}
     try {
         await clearFileSession();
     } catch (e) {

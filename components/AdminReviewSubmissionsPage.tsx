@@ -689,6 +689,11 @@ const AdminReviewSubmissionsPage: React.FC<AdminReviewSubmissionsPageProps> = ({
         alert("Please allow popups to print biodata.");
         return;
       }
+      try {
+        if (printWindow.opener) {
+          printWindow.opener = null;
+        }
+      } catch {}
 
       printWindow.document.write(`
         <!DOCTYPE html>
@@ -852,7 +857,7 @@ const AdminReviewSubmissionsPage: React.FC<AdminReviewSubmissionsPageProps> = ({
               </div>
               <div class="header-meta-row">
                 <div>Referred By: ${recruitedByName || '_______________________'}</div>
-                <div>Reg. No.: HY _________________</div>
+                <div>Reg. No.: ${esc((sub as any).employeeId || (sub as any).regNo || sub.id || 'HY _________________')}</div>
               </div>
             </div>
             <div class="photo-box">
@@ -1212,7 +1217,7 @@ const AdminReviewSubmissionsPage: React.FC<AdminReviewSubmissionsPageProps> = ({
     const allFormFields = activeSections.flatMap(sec =>
       (sec.fields || []).map(f => ({
         ...f,
-        sectionTitle: sec.title || 'General'
+        sectionTitle: sec.name || (sec as any).title || 'General'
       }))
     ).filter(f => f && f.type !== FieldType.HEADER && f.type !== FieldType.INFO_TEXT);
 
@@ -1507,91 +1512,91 @@ const AdminReviewSubmissionsPage: React.FC<AdminReviewSubmissionsPageProps> = ({
 
   const handleConfirmApproval = async () => {
     if (!approvalTargetSubmission || isSubmittingApproval) return;
+    setIsSubmittingApproval(true);
 
-    const isFinal = isFinalStep(approvalTargetSubmission) || isBypassMode;
+    try {
+      const isFinal = isFinalStep(approvalTargetSubmission) || isBypassMode;
 
-    if (isFinal) {
-      const effectiveDup = getEffectiveDuplicateCheck(approvalTargetSubmission);
-      const blockingMatches = effectiveDup?.matches?.filter(m =>
-        m.matchType === 'EXISTING_ACTIVE_EMPLOYEE' || (isFinal && m.matchType === 'DUPLICATE_SUBMISSION')
-      ) || ((effectiveDup?.matchType === 'EXISTING_ACTIVE_EMPLOYEE' || (isFinal && effectiveDup?.matchType === 'DUPLICATE_SUBMISSION')) ? [effectiveDup] : []);
+      if (isFinal) {
+        const effectiveDup = getEffectiveDuplicateCheck(approvalTargetSubmission);
+        const blockingMatches = effectiveDup?.matches?.filter(m =>
+          m.matchType === 'EXISTING_ACTIVE_EMPLOYEE' || (isFinal && m.matchType === 'DUPLICATE_SUBMISSION')
+        ) || ((effectiveDup?.matchType === 'EXISTING_ACTIVE_EMPLOYEE' || (isFinal && effectiveDup?.matchType === 'DUPLICATE_SUBMISSION')) ? [effectiveDup] : []);
 
-      // 1. HARD BLOCK ON ACTIVE EMPLOYEE OR DUPLICATE SUBMISSION
-      if (effectiveDup?.isDuplicate && blockingMatches.length > 0) {
-        const conflictDetails = blockingMatches.map((m, i) => `${i + 1}. ${m.matchedField}: "${m.matchedValue}" (${m.matchType === 'EXISTING_ACTIVE_EMPLOYEE' ? `Active Emp: ${m.matchedName || m.matchedId}` : `Submission: ${m.submissionId || 'Earlier App'}, Status: ${m.submissionStatus || 'Pending'}`}, Site: ${m.matchedSite || 'N/A'})`).join('\n');
-        alert(
-          `❌ CANNOT APPROVE / ASSIGN ID: DUPLICATE CONFLICTS DETECTED!\n\n` +
-          `Conflicting application records found:\n${conflictDetails}\n\n` +
-          `Strict Security Rule: Final approval and Employee ID assignment are strictly blocked for duplicate submissions.\n\nPlease reject or resolve the duplicate submission before proceeding.`
-        );
-        return;
-      }
+        // 1. HARD BLOCK ON ACTIVE EMPLOYEE OR DUPLICATE SUBMISSION
+        if (effectiveDup?.isDuplicate && blockingMatches.length > 0) {
+          const conflictDetails = blockingMatches.map((m, i) => `${i + 1}. ${m.matchedField}: "${m.matchedValue}" (${m.matchType === 'EXISTING_ACTIVE_EMPLOYEE' ? `Active Emp: ${m.matchedName || m.matchedId}` : `Submission: ${m.submissionId || 'Earlier App'}, Status: ${m.submissionStatus || 'Pending'}`}, Site: ${m.matchedSite || 'N/A'})`).join('\n');
+          alert(
+            `❌ CANNOT APPROVE / ASSIGN ID: DUPLICATE CONFLICTS DETECTED!\n\n` +
+            `Conflicting application records found:\n${conflictDetails}\n\n` +
+            `Strict Security Rule: Final approval and Employee ID assignment are strictly blocked for duplicate submissions.\n\nPlease reject or resolve the duplicate submission before proceeding.`
+          );
+          return;
+        }
 
-      // 2. CONFIRMATION FOR EX-EMPLOYEE REHIRE
-      if (effectiveDup?.isDuplicate && effectiveDup.matchType === 'EX_EMPLOYEE_REHIRE') {
-        const confirmRehire = window.confirm(
-          `⚠️ NOTICE: EX-EMPLOYEE REHIRE DETECTED\n\n` +
-          `Candidate: ${effectiveDup.matchedName}\n` +
-          `Previous Employee ID: ${effectiveDup.matchedId}\n` +
-          `Relieved Date: ${effectiveDup.relievingDate || 'N/A'}\n` +
-          `Relieving Reason: ${effectiveDup.relievingReason || 'N/A'}\n\n` +
-          `Do you confirm approving this candidate as a rehire under new Employee ID "${customEmployeeId.trim()}"?`
-        );
-        if (!confirmRehire) {
+        // 2. CONFIRMATION FOR EX-EMPLOYEE REHIRE
+        if (effectiveDup?.isDuplicate && effectiveDup.matchType === 'EX_EMPLOYEE_REHIRE') {
+          const confirmRehire = window.confirm(
+            `⚠️ NOTICE: EX-EMPLOYEE REHIRE DETECTED\n\n` +
+            `Candidate: ${effectiveDup.matchedName}\n` +
+            `Previous Employee ID: ${effectiveDup.matchedId}\n` +
+            `Relieved Date: ${effectiveDup.relievingDate || 'N/A'}\n` +
+            `Relieving Reason: ${effectiveDup.relievingReason || 'N/A'}\n\n` +
+            `Do you confirm approving this candidate as a rehire under new Employee ID "${customEmployeeId.trim()}"?`
+          );
+          if (!confirmRehire) {
+            return;
+          }
+        }
+
+        if (!customEmployeeId.trim()) {
+          setEmployeeIdError('Employee ID is required for final approval.');
+          return;
+        }
+        if (!EMPLOYEE_ID_REGEX.test(customEmployeeId.trim())) {
+          setEmployeeIdError('Invalid format (e.g., HY123456).');
+          return;
+        }
+      } else if (customEmployeeId.trim()) {
+        const effectiveDup = getEffectiveDuplicateCheck(approvalTargetSubmission);
+        if (effectiveDup?.isDuplicate && effectiveDup.matchType === 'DUPLICATE_SUBMISSION') {
+          alert(
+            `❌ CANNOT ASSIGN ID: DUPLICATE SUBMISSION DETECTED!\n\n` +
+            `Another submission (${effectiveDup.submissionId}) matches this applicant's ${effectiveDup.matchedField} (${effectiveDup.matchedValue}).\n\n` +
+            `Employee ID assignment is blocked for duplicate submissions.`
+          );
+          return;
+        }
+        if (!EMPLOYEE_ID_REGEX.test(customEmployeeId.trim())) {
+          setEmployeeIdError('Invalid format (e.g., HY123456).');
           return;
         }
       }
 
-      if (!customEmployeeId.trim()) {
-        setEmployeeIdError('Employee ID is required for final approval.');
+      if (isFinal && profileCompletionOption === 'INCOMPLETE' && selectedPendingFields.length === 0) {
+        alert("⚠️ You selected 'Incomplete Profile', but no pending fields are selected.\n\nPlease select at least one field requiring completion/correction, or switch the status to 'Complete Profile'.");
         return;
       }
-      if (!EMPLOYEE_ID_REGEX.test(customEmployeeId.trim())) {
-        setEmployeeIdError('Invalid format (e.g., HY123456).');
-        return;
-      }
-    } else if (customEmployeeId.trim()) {
-      const effectiveDup = getEffectiveDuplicateCheck(approvalTargetSubmission);
-      if (effectiveDup?.isDuplicate && effectiveDup.matchType === 'DUPLICATE_SUBMISSION') {
-        alert(
-          `❌ CANNOT ASSIGN ID: DUPLICATE SUBMISSION DETECTED!\n\n` +
-          `Another submission (${effectiveDup.submissionId}) matches this applicant's ${effectiveDup.matchedField} (${effectiveDup.matchedValue}).\n\n` +
-          `Employee ID assignment is blocked for duplicate submissions.`
-        );
-        return;
-      }
-      if (!EMPLOYEE_ID_REGEX.test(customEmployeeId.trim())) {
-        setEmployeeIdError('Invalid format (e.g., HY123456).');
-        return;
-      }
-    }
 
-    if (isFinal && profileCompletionOption === 'INCOMPLETE' && selectedPendingFields.length === 0) {
-      alert("⚠️ You selected 'Incomplete Profile', but no pending fields are selected.\n\nPlease select at least one field requiring completion/correction, or switch the status to 'Complete Profile'.");
-      return;
-    }
+      const profileData = isFinal ? {
+        profileCompletionStatus: profileCompletionOption,
+        pendingProfileFields: profileCompletionOption === 'INCOMPLETE' ? selectedPendingFields : [],
+        pendingProfileNote: profileCompletionOption === 'INCOMPLETE' ? pendingNote.trim() : ''
+      } : undefined;
 
-    const profileData = isFinal ? {
-      profileCompletionStatus: profileCompletionOption,
-      pendingProfileFields: profileCompletionOption === 'INCOMPLETE' ? selectedPendingFields : [],
-      pendingProfileNote: profileCompletionOption === 'INCOMPLETE' ? pendingNote.trim() : ''
-    } : undefined;
-
-    let customRecruiter: { id: string | null; name: string | null } | undefined = undefined;
-    if (effectiveIsSuperAdmin) {
-      if (selectedRecruiterId) {
-        const foundStaff = (staffUsers || []).find(s => s.id === selectedRecruiterId);
-        customRecruiter = {
-          id: selectedRecruiterId,
-          name: foundStaff?.name || foundStaff?.username || 'Staff'
-        };
-      } else {
-        customRecruiter = { id: null, name: null };
+      let customRecruiter: { id: string | null; name: string | null } | undefined = undefined;
+      if (effectiveIsSuperAdmin) {
+        if (selectedRecruiterId) {
+          const foundStaff = (staffUsers || []).find(s => s.id === selectedRecruiterId);
+          customRecruiter = {
+            id: selectedRecruiterId,
+            name: foundStaff?.name || foundStaff?.username || 'Staff'
+          };
+        } else {
+          customRecruiter = { id: null, name: null };
+        }
       }
-    }
 
-    setIsSubmittingApproval(true);
-    try {
       await onApprove(approvalTargetSubmission.id, customEmployeeId.trim(), adminComments, false, isBypassMode, profileData, customJoiningDate, customRecruiter);
       const nextLevel = approvalTargetSubmission.currentLevel + 1;
       setPaginatedData(prev => prev.map(sub => 
@@ -2248,7 +2253,7 @@ const AdminReviewSubmissionsPage: React.FC<AdminReviewSubmissionsPageProps> = ({
               )}
 
               {(() => {
-                const canAssignId = userRole?.permissions.includes(Permission.SUBMISSIONS_ASSIGN_EMPLOYEE_ID) || isSuperAdmin;
+                const canAssignId = (!userRole?.isDisabled && userRole?.permissions.includes(Permission.SUBMISSIONS_ASSIGN_EMPLOYEE_ID)) || isSuperAdmin;
                 const showIdInput = isFinalStep(approvalTargetSubmission) || isBypassMode || canAssignId;
                 if (!showIdInput) return null;
 
@@ -2461,7 +2466,7 @@ const AdminReviewSubmissionsPage: React.FC<AdminReviewSubmissionsPageProps> = ({
                         const modalAllFields = modalActiveSections.flatMap(sec =>
                           (sec.fields || []).map(f => ({
                             ...f,
-                            sectionTitle: sec.title || 'General'
+                            sectionTitle: sec.name || (sec as any).title || 'General'
                           }))
                         ).filter(f => f && f.type !== FieldType.HEADER && f.type !== FieldType.INFO_TEXT);
 

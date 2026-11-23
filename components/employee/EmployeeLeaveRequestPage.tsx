@@ -17,11 +17,12 @@ interface EmployeeLeaveRequestPageProps {
   leavePolicy?: LeavePolicy;
   activeAssignments?: any[];
   sites?: any[];
+  currentSiteId?: string;
 }
 
 const EmployeeLeaveRequestPage: React.FC<EmployeeLeaveRequestPageProps> = ({ 
   employeeId, existingRequests, onSubmitRequest, roles, workflowConfigs, leaveBalances = [], leavePolicy,
-  activeAssignments = [], sites = []
+  activeAssignments = [], sites = [], currentSiteId
 }) => {
   const [leaveType, setLeaveType] = useState<string>('');
   const [selectedSiteId, setSelectedSiteId] = useState('');
@@ -44,17 +45,44 @@ const EmployeeLeaveRequestPage: React.FC<EmployeeLeaveRequestPageProps> = ({
 
   // Get current balance for this employee
   const currentBalance = useMemo(() =>
-    leaveBalances.find(b => b.employeeId === employeeId) || null
+    leaveBalances.find(b => 
+      b.employeeId === employeeId || 
+      b.portalId === employeeId || 
+      b.id === employeeId || 
+      b.uid === employeeId ||
+      ((b as any).employeeId && (b as any).employeeId.toLowerCase() === employeeId.toLowerCase())
+    ) || null
     , [leaveBalances, employeeId]);
 
   const getBalance = (type: string) => {
-    if (!currentBalance) return { total: 0, used: 0, remaining: 0 };
-    const bal = currentBalance.balances[type];
+    if (!currentBalance || !currentBalance.balances) return { total: 0, used: 0, remaining: 0 };
+    let bal = currentBalance.balances[type];
+
+    if (!bal && leavePolicy && leavePolicy.leaveTypes) {
+      const matched = leavePolicy.leaveTypes.find(lt => lt.typeId === type || lt.label.toLowerCase() === type.toLowerCase());
+      if (matched) {
+        bal = currentBalance.balances[matched.label] || 
+              currentBalance.balances[matched.typeId] ||
+              currentBalance.balances[matched.label.toLowerCase()] ||
+              currentBalance.balances[matched.typeId.toLowerCase()];
+      }
+    }
+
+    // Fallback: check case-insensitive match across all keys in currentBalance.balances
+    if (!bal) {
+      const lower = type.toLowerCase();
+      const foundKey = Object.keys(currentBalance.balances).find(k => k.toLowerCase() === lower || k.toLowerCase().startsWith(lower));
+      if (foundKey) {
+        bal = currentBalance.balances[foundKey];
+      }
+    }
 
     // Handle legacy or dynamic UNPAID logic
-    if (type === LeaveType.UNPAID) return { total: '∞', used: bal?.used || 0, remaining: '∞' };
+    if (type === LeaveType.UNPAID || type.toLowerCase().includes('unpaid')) {
+      return { total: '∞', used: bal?.used || 0, remaining: '∞' };
+    }
 
-    return { total: bal?.total || 0, used: bal?.used || 0, remaining: (bal?.total || 0) - (bal?.used || 0) };
+    return { total: bal?.total || 0, used: bal?.used || 0, remaining: Math.max(0, (bal?.total || 0) - (bal?.used || 0)) };
   };
 
   const activeLeaveTypes = useMemo(() => {
@@ -124,7 +152,7 @@ const EmployeeLeaveRequestPage: React.FC<EmployeeLeaveRequestPageProps> = ({
 
     const finalSiteId = activeDeployments.length > 1 
       ? selectedSiteId 
-      : (activeDeployments[0]?.siteId || '');
+      : (activeDeployments[0]?.siteId || currentSiteId || (sites && sites.length === 1 ? sites[0].id : '') || 'UNASSIGNED');
 
     try {
       await onSubmitRequest({ employeeId, leaveType, startDate, endDate, reason, supportingDoc, siteId: finalSiteId });

@@ -345,15 +345,17 @@ export const purgeAbandonedDrafts = async (days: number = 30) => {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - days);
 
-    let deletedCount = 0;
-    for (const docSnap of snap.docs) {
+    const staleDocs = snap.docs.filter(docSnap => {
         const data = docSnap.data() as DraftSubmission;
         const lastUpdated = data.lastUpdated ? new Date(data.lastUpdated) : null;
-        
-        if (!lastUpdated || isNaN(lastUpdated.getTime()) || lastUpdated < cutoff) {
-            await deleteDraftSubmission(docSnap.id);
-            deletedCount++;
-        }
+        return !lastUpdated || isNaN(lastUpdated.getTime()) || lastUpdated < cutoff;
+    });
+
+    let deletedCount = 0;
+    for (let i = 0; i < staleDocs.length; i += 10) {
+        const chunk = staleDocs.slice(i, i + 10);
+        await Promise.all(chunk.map(d => deleteDraftSubmission(d.id)));
+        deletedCount += chunk.length;
     }
     return { deletedCount };
 };
@@ -887,7 +889,8 @@ export const submitEmployeeForm = async (
                             const firebaseUrl = await uploadSubmissionDocument(
                                 key,
                                 value,
-                                (percent) => onProgress?.(key, 'loading', Math.round(percent))
+                                (percent) => onProgress?.(key, 'loading', Math.round(percent)),
+                                submissionId
                             );
                             log.log(`[STORAGE] ✅ Uploaded ${value.name} to Firebase Storage.`);
                             
@@ -989,9 +992,10 @@ export const submitEmployeeForm = async (
             googleFormSyncStatus: 'pending',
             googleFormSyncedAt: null,
             legacyImportId: legacyImportId || null,
-            linkedUid: auth.currentUser?.uid || null,
+            linkedUid: linkedUid || (auth.currentUser && !auth.currentUser.isAnonymous ? auth.currentUser.uid : null),
             authProvider: authProvider,
             inviteId: referralInviteId,
+            referralJoinedRecorded: !!referralInviteId,
             recruitedBy,
             recruitedByName,
             aadhaarNumber: aadhaarNumber || null,
@@ -1031,14 +1035,13 @@ export const submitEmployeeForm = async (
         const docRef = doc(db, SUBMISSIONS_COLLECTION, submissionId);
         await setDoc(docRef, submission);
 
-        // Increment referral joined count to retire single-use links or count successful joins
+        // Increment referral joined count via server callable
         if (referralInviteId) {
             try {
-                const inviteRef = doc(db, 'referral_invites', referralInviteId);
-                await updateDoc(inviteRef, { joined: increment(1) });
-                log.log(`[SUBMIT] Successfully incremented joined count for referral invite ${referralInviteId}`);
+                await incrementReferralJoined(referralInviteId);
+                log.log(`[SUBMIT] Successfully recorded joined count for referral invite ${referralInviteId}`);
             } catch (inviteUpdateErr) {
-                console.warn('[SUBMIT] Non-fatal error incrementing referral joined count:', inviteUpdateErr);
+                console.warn('[SUBMIT] Non-fatal error recording referral joined count:', inviteUpdateErr);
             }
         }
 
@@ -1197,11 +1200,13 @@ export const getPaginatedSubmissions = async (
             }
 
             allSubmissions = allSubmissions.filter(sub => {
-                const val = sub.data?.[siteFieldId];
+                const val = sub.data?.[siteFieldId] || sub.siteId || sub.siteName || sub.currentSiteId;
                 if (!val) return false;
                 
                 // Case A: The stored value is already a site ID
                 if (allowed.includes(val)) return true;
+                if (sub.siteId && allowed.includes(sub.siteId)) return true;
+                if (sub.currentSiteId && allowed.includes(sub.currentSiteId)) return true;
                 
                 // Case B: The stored value is a site Name (legacy submission)
                 // Find if the site with this name is allowed
@@ -1216,14 +1221,20 @@ export const getPaginatedSubmissions = async (
             });
         }
 
-        // 2. Apply Search Filter
+        // 2. Apply Search Filter across applicantName, employeeId, docId, phone, aadhaar, recruiter, and invite
         if (hasSearchFilter) {
             const term = searchTerm.trim().toLowerCase();
             allSubmissions = allSubmissions.filter(sub => {
                 const targetValue = sub[searchField] || sub.data?.[searchField] || '';
+                const empId = sub.employeeId || sub.badgeId || sub.id || '';
+                const phone = sub.phoneNumber || sub.phone || sub.mobile || sub.data?.phoneNumber || sub.data?.phone || '';
+                const aadhaar = sub.aadhaarNumber || sub.data?.aadhaarNumber || '';
                 const recruiter = sub.recruitedByName || '';
                 const inviteCode = sub.inviteId || '';
                 return String(targetValue).toLowerCase().includes(term) ||
+                    empId.toLowerCase().includes(term) ||
+                    phone.toLowerCase().includes(term) ||
+                    aadhaar.toLowerCase().includes(term) ||
                     recruiter.toLowerCase().includes(term) ||
                     inviteCode.toLowerCase().includes(term);
             });
@@ -1309,10 +1320,7 @@ export const getPaginatedEmployees = async (
 
     if (viewMode === 'ACTIVE') {
         constraints.push(where("isActive", "==", true));
-        // Only use Firestore 'in' if sites are not restricted, to prevent combining 'in' with 'array-contains-any'
-        if (!isRestrictedSites && !hasSiteFilter) {
-            constraints.push(where("needsProfileCompletion", "in", [false, null]));
-        }
+        // Note: needsProfileCompletion is filtered in-memory below (L1439) so documents missing this field (legacy) are not dropped (UDF-AUD-207)
     } else if (viewMode === 'PENDING') {
         constraints.push(where("needsProfileCompletion", "==", true));
         constraints.push(where("isActive", "==", true)); // Assuming pending employees are logically "Active" but incomplete
@@ -1946,11 +1954,14 @@ export const updateSubmissionStatus = async (
                 }
             }
 
-            // Increment joined count on referral invite atomically
-            if (data.inviteId) {
+            // Increment joined count on referral invite atomically if not already recorded at submission
+            if (data.inviteId && !data.referralJoinedRecorded) {
                 try {
                     const inviteRef = doc(db, 'referral_invites', data.inviteId);
-                    approvalBatch.update(inviteRef, { joined: increment(1) });
+                    const inviteSnap = await getDoc(inviteRef);
+                    if (inviteSnap.exists()) {
+                        approvalBatch.update(inviteRef, { joined: increment(1) });
+                    }
                 } catch (e) {
                     console.error("Failed to increment joined count on referral invite:", e);
                 }
@@ -2151,19 +2162,31 @@ export const subscribeToSubmissionsByUid = (uid: string, callback: (submissions:
         empDocs = snap.docs.map(d => ({ id: d.id, ...d.data() } as OnboardingSubmission));
         hasEmpReturned = true;
         emit();
-    }, (error) => console.log('subscribeToSubmissionsByUid EmpId Error:', error));
+    }, (error) => {
+        log.error('subscribeToSubmissionsByUid EmpId Error:', error);
+        hasEmpReturned = true;
+        emit();
+    });
     
     const unsubUid = onSnapshot(qByUid, (snap) => {
         uidDocs = snap.docs.map(d => ({ id: d.id, ...d.data() } as OnboardingSubmission));
         hasUidReturned = true;
         emit();
-    }, (error) => console.log('subscribeToSubmissionsByUid Uid Error:', error));
+    }, (error) => {
+        log.error('subscribeToSubmissionsByUid Uid Error:', error);
+        hasUidReturned = true;
+        emit();
+    });
 
     const unsubLinkedUid = onSnapshot(qByLinkedUid, (snap) => {
         linkedUidDocs = snap.docs.map(d => ({ id: d.id, ...d.data() } as OnboardingSubmission));
         hasLinkedUidReturned = true;
         emit();
-    }, (error) => console.log('subscribeToSubmissionsByUid LinkedUid Error:', error));
+    }, (error) => {
+        log.error('subscribeToSubmissionsByUid LinkedUid Error:', error);
+        hasLinkedUidReturned = true;
+        emit();
+    });
 
     const unsubDoc = onSnapshot(docRef, (docSnap) => {
         if (docSnap.exists()) {
@@ -2173,7 +2196,11 @@ export const subscribeToSubmissionsByUid = (uid: string, callback: (submissions:
         }
         hasDocReturned = true;
         emit();
-    }, (error) => console.log('subscribeToSubmissionsByUid Doc Error:', error));
+    }, (error) => {
+        log.error('subscribeToSubmissionsByUid Doc Error:', error);
+        hasDocReturned = true;
+        emit();
+    });
 
     return () => {
         unsubEmpId();
@@ -2366,9 +2393,8 @@ export const revertSubmissionWorkflow = async (
         (async () => {
             try {
                 const empId = data.employeeId || submissionId;
-                const joinerUid = data.linkedUid || submissionId;
                 const currentStoragePath = `employees/${empId}`;
-                const targetStoragePath = `onboarding/${joinerUid}`;
+                const targetStoragePath = `onboarding/${submissionId}`;
                 
                 log.log(`[REVERT_CLEANUP] Reverting Firebase Storage from: "${currentStoragePath}" to "${targetStoragePath}"`);
                 await moveStorageFiles(currentStoragePath, targetStoragePath);
@@ -2399,10 +2425,29 @@ export const revertSubmissionWorkflow = async (
         timestamp: new Date().toISOString()
     };
 
+    const rewritePaths = (obj: any): any => {
+        if (!obj || typeof obj !== 'object') return obj;
+        if (Array.isArray(obj)) return obj.map(rewritePaths);
+        const res: any = {};
+        for (const k of Object.keys(obj)) {
+            const val = obj[k];
+            if (val && typeof val === 'object' && typeof val.storagePath === 'string') {
+                res[k] = { ...val, storagePath: val.storagePath.replace(`employees/${data.employeeId}`, `onboarding/${submissionId}`) };
+            } else if (typeof val === 'string' && data.employeeId && val.includes(`employees/${data.employeeId}`)) {
+                res[k] = val.replace(`employees/${data.employeeId}`, `onboarding/${submissionId}`);
+            } else {
+                res[k] = rewritePaths(val);
+            }
+        }
+        return res;
+    };
+    const updatedFormData = data.formData ? rewritePaths(data.formData) : data.formData;
+
     await updateDoc(subRef, {
         status: 'Pending Review',
         currentLevel: targetLevel,
         employeeId: '', // Clear assigned ID
+        formData: updatedFormData,
         approvalHistory: [...currentHistory, revertEntry],
         lastUpdated: new Date().toISOString()
     });
@@ -2534,11 +2579,13 @@ export const restoreEmployee = async (targetId: string) => {
 
     // 2. Restore employee document
     if (empSnap.exists()) {
+        const wasRelieved = !!(empData?.isRelieved || (empData as any)?.status === 'Relieved' || empData?.relievingDate);
         await updateDoc(empDocRef, {
             deletedAt: deleteField(),
-            isActive: true,
+            isActive: !wasRelieved,
             isBlocked: false,
-            isRelieved: false
+            isRelieved: wasRelieved,
+            status: wasRelieved ? 'Relieved' : 'Active'
         });
     }
 
@@ -2614,6 +2661,9 @@ export const relieveEmployee = async (
             isActive: false,
             status: 'Relieved',
             isRelieved: true,
+            currentSiteId: null,
+            assignedSiteIds: [],
+            activeAssignments: [],
             relievingDate: relievingDate,
             relievingReason: relievingReason
         });
@@ -2626,6 +2676,9 @@ export const relieveEmployee = async (
                 isActive: false,
                 status: 'Relieved',
                 isRelieved: true,
+                currentSiteId: null,
+                assignedSiteIds: [],
+                activeAssignments: [],
                 relievingDate: relievingDate,
                 relievingReason: relievingReason
             });
@@ -2640,8 +2693,8 @@ export const relieveEmployee = async (
         'Unknown';
 
     log.log(`Relieving employee ${employeeId} (${applicantName}) on ${relievingDate}. Reason: ${relievingReason}`);
-    // Move to a "Relieved" folder in Drive (uses block_employee action which moves to BLOCKED/RELIEVED folder)
-    await moveEmployeeFolder(applicantName, employeeId, 'block_employee', folderName);
+    // Move to "Relieved Employees" folder in Drive (UDF-AUD-198)
+    await moveEmployeeFolder(applicantName, employeeId, 'relieve_employee', folderName);
 };
 
 // Set Employee Notice Period on Approved Future Resignation
@@ -2753,7 +2806,7 @@ export const rejoinEmployee = async (
         } else {
             const folderName = empData?.driveFolderName;
             log.log(`Rejoining employee ${employeeId} (${applicantName}) on ${rejoinDate}. New site: ${siteName}, Designation: ${designation}`);
-            await moveEmployeeFolder(applicantName, employeeId, 'restore_employee', folderName);
+            await moveEmployeeFolder(applicantName, employeeId, 'rejoin_employee', folderName);
         }
         return;
     } catch (serverErr: any) {
@@ -2922,8 +2975,8 @@ export const rejoinEmployee = async (
     const folderName = empData?.driveFolderName;
 
     log.log(`Rejoining employee ${employeeId} (${applicantName}) on ${rejoinDate}. New site: ${siteName}, Designation: ${designation}`);
-    // Only move folder if standard rejoin
-    await moveEmployeeFolder(applicantName, employeeId, 'restore_employee', folderName);
+    // Move folder back to Active Employees (UDF-AUD-198)
+    await moveEmployeeFolder(applicantName, employeeId, 'rejoin_employee', folderName);
 };
 
 // --- Multi-Site & Per-Site Lifecycle ---
@@ -2942,7 +2995,10 @@ export const assignToSite = async (
         status: 'Active'
     };
 
-    const newAssignments = [...(empData.activeAssignments || []), newAssignment];
+    const existingAssignments = (empData.activeAssignments || []).map(a =>
+        (assignment.type === 'PRIMARY' && a.type === 'PRIMARY') ? { ...a, type: 'SECONDARY' as const } : a
+    );
+    const newAssignments = [...existingAssignments, newAssignment];
     const updates: any = {
         activeAssignments: newAssignments,
         assignedSiteIds: Array.from(new Set(newAssignments.map(a => a.siteId)))
@@ -3018,8 +3074,8 @@ export const promoteEmployee = async (params: PromoteEmployeeParams): Promise<Pr
         fromDesignation: currentDesignation,
         toDesignation: newDesignation,
         effectiveDate: effectiveDate || new Date().toISOString().split('T')[0],
-        siteId: newSiteId || empData.currentSiteId || undefined,
-        siteName: newSiteName || empData.siteName || undefined,
+        siteId: newSiteId || empData.currentSiteId || '',
+        siteName: newSiteName || empData.siteName || '',
         referenceNo: cleanRefNo,
         remarks: remarks || '',
         promotedAt: new Date().toISOString(),
@@ -3127,6 +3183,13 @@ export const relieveFromSite = async (
     }
 
     await updateDoc(empRef, updates);
+    if (newActive.length === 0) {
+        try {
+            await relieveEmployee(empData.employeeId || employeeId, relievingDate, (relievingReason as any) || 'Other');
+        } catch (e) {
+            console.warn("[relieveFromSite] Auto relieveEmployee call failed or handled:", e);
+        }
+    }
     await logSystemAction('UPDATE', 'EMPLOYEES', `Relieved employee ${empData.applicantName || (empData as any).employeeName || employeeId} (${employeeId}) from assignment ${assignmentId} (Reason: ${relievingReason})`);
 };
 
@@ -4192,26 +4255,61 @@ export const verifyEmployeeLogin = async (employeeId: string, password: string, 
 };
 
 export const getSiteHeadcounts = async (sites: Site[], formSections: FormSection[]) => {
-    const unitField = formSections
-        .flatMap(s => s.fields || [])
-        .find(f => f && f.label && (f.label.toLowerCase().includes('unit') || f.label.toLowerCase().includes('facility')));
+    if (!sites || sites.length === 0) return {};
 
-    if (!unitField) return {};
+    const unitField = formSections
+        ?.flatMap(s => s.fields || [])
+        ?.find(f => f && f.label && (f.label.toLowerCase().includes('unit') || f.label.toLowerCase().includes('facility')));
 
     const counts: Record<string, number> = {};
 
     const promises = sites.map(async (site) => {
         try {
-            const q = query(
+            // Primary check: currentSiteId == site.id
+            const qById = query(
                 collection(db, EMPLOYEES_COLLECTION),
                 where("isActive", "==", true),
-                where(`data.${unitField.id}`, "==", site.name)
+                where("currentSiteId", "==", site.id)
             );
-            const snapshot = await getCountFromServer(q);
-            counts[site.name] = snapshot.data().count;
+            const snapById = await getCountFromServer(qById);
+            let count = snapById.data().count;
+
+            // Fallback 1: if count is 0 and unitField exists, check data[unitField.id] == site.name
+            if (count === 0 && unitField) {
+                try {
+                    const qByUnit = query(
+                        collection(db, EMPLOYEES_COLLECTION),
+                        where("isActive", "==", true),
+                        where(`data.${unitField.id}`, "==", site.name)
+                    );
+                    const snapByUnit = await getCountFromServer(qByUnit);
+                    count = snapByUnit.data().count;
+                } catch {
+                    // ignore index/permission error
+                }
+            }
+
+            // Fallback 2: if still 0, check siteName == site.name
+            if (count === 0 && site.name) {
+                try {
+                    const qByName = query(
+                        collection(db, EMPLOYEES_COLLECTION),
+                        where("isActive", "==", true),
+                        where("siteName", "==", site.name)
+                    );
+                    const snapByName = await getCountFromServer(qByName);
+                    count = snapByName.data().count;
+                } catch {
+                    // ignore index/permission error
+                }
+            }
+
+            counts[site.name] = count;
+            counts[site.id] = count;
         } catch (err) {
             log.log("[getSiteHeadcounts] Headcount query failed/restricted for site:", site.name, err);
             counts[site.name] = 0;
+            counts[site.id] = 0;
         }
     });
 
@@ -4219,12 +4317,13 @@ export const getSiteHeadcounts = async (sites: Site[], formSections: FormSection
     return counts;
 };
 
-// In-memory 60-second cache to prevent repeated reads on tab switches (EDGE-D4C-02)
-let _empLookupCache: { timestamp: number; data: Record<string, { name: string, siteName: string, id: string, siteId?: string }> } | null = null;
+// In-memory 60-second cache partitioned by scope to prevent cross-scope leaks (UDF-AUD-96)
+let _empLookupCache: { scopeKey: string; timestamp: number; data: Record<string, { name: string, siteName: string, id: string, siteId?: string }> } | null = null;
 
 export const getEmployeeLookupMap = async (formSections: FormSection[], allowedSiteIds?: string[]) => {
-    // If cache is fresh (less than 60s old), return cached map instantly (0 reads)
-    if (_empLookupCache && (Date.now() - _empLookupCache.timestamp < 60000)) {
+    const scopeKey = allowedSiteIds === undefined ? '__ALL__' : [...allowedSiteIds].sort().join(',');
+    // If cache is fresh (less than 60s old) and matches the scope, return cached map instantly (0 reads)
+    if (_empLookupCache && _empLookupCache.scopeKey === scopeKey && (Date.now() - _empLookupCache.timestamp < 60000)) {
         return _empLookupCache.data;
     }
 
@@ -4234,50 +4333,70 @@ export const getEmployeeLookupMap = async (formSections: FormSection[], allowedS
 
     // Fallback lookup if unitField is missing
     const unitFieldId = unitField?.id;
-
-    // Fetch both active and past employees so past records (disciplinary, leaves, resignations) resolve names correctly (EDGE-D4C-02)
-    let q = query(collection(db, EMPLOYEES_COLLECTION));
-    if (allowedSiteIds && allowedSiteIds.length > 0) {
-        q = query(
-            collection(db, EMPLOYEES_COLLECTION),
-            where("currentSiteId", "in", allowedSiteIds.slice(0, 10))
-        );
-    }
-    const snapshot = await getDocs(q);
     const lookup: Record<string, { name: string, siteName: string, id: string, siteId?: string }> = {};
 
-    snapshot.docs.forEach(doc => {
-        const data = doc.data() as any;
+    // Fetch both active and past employees so past records (disciplinary, leaves, resignations) resolve names correctly (EDGE-D4C-02)
+    // If scoped by allowedSiteIds, chunk into groups of 10 to satisfy Firestore limits without truncating beyond 10 sites (UDF-AUD-96)
+    if (allowedSiteIds && allowedSiteIds.length > 0) {
+        const chunks: string[][] = [];
+        for (let i = 0; i < allowedSiteIds.length; i += 10) {
+            chunks.push(allowedSiteIds.slice(i, i + 10));
+        }
+        const snapshots = await Promise.all(
+            chunks.map(chunk => getDocs(query(
+                collection(db, EMPLOYEES_COLLECTION),
+                where("currentSiteId", "in", chunk)
+            )))
+        );
+        snapshots.forEach(snapshot => {
+            snapshot.docs.forEach(doc => {
+                const data = doc.data() as any;
+                const empId = data.employeeId || doc.id;
+                lookup[empId] = {
+                    id: doc.id,
+                    name: data.applicantName || 'Unknown',
+                    siteName: data.siteName || (unitFieldId ? (data.data?.[unitFieldId] || '') : ''),
+                    siteId: data.currentSiteId || data.siteId || ''
+                };
+            });
+        });
+    } else {
+        const snapshot = await getDocs(query(collection(db, EMPLOYEES_COLLECTION)));
+        snapshot.docs.forEach(doc => {
+            const data = doc.data() as any;
+            const empId = data.employeeId || doc.id;
+            lookup[empId] = {
+                id: doc.id,
+                name: data.applicantName || 'Unknown',
+                siteName: data.siteName || (unitFieldId ? (data.data?.[unitFieldId] || '') : ''),
+                siteId: data.currentSiteId || data.siteId || ''
+            };
+        });
+    }
 
-        const empId = data.employeeId || doc.id;
-        lookup[empId] = {
-            id: doc.id,
-            name: data.applicantName || 'Unknown',
-            siteName: data.siteName || (unitFieldId ? (data.data?.[unitFieldId] || '') : ''),
-            siteId: data.currentSiteId || data.siteId || ''
-        };
-    });
-
-    _empLookupCache = { timestamp: Date.now(), data: lookup };
+    _empLookupCache = { scopeKey, timestamp: Date.now(), data: lookup };
     return lookup;
 };
 
 export const purgeEmployeesCollection = async () => {
     const snap = await getDocs(collection(db, EMPLOYEES_COLLECTION));
 
-    for (const docSnap of snap.docs) {
-        const empId = docSnap.id;
-        // 1. Cascading sweep for EVERY employee (Wipe traces)
-        await deleteAssociatedRecords(empId);
+    for (let i = 0; i < snap.docs.length; i += 10) {
+        const chunk = snap.docs.slice(i, i + 10);
+        await Promise.all(chunk.map(async (docSnap) => {
+            const empId = docSnap.id;
+            // 1. Cascading sweep for EVERY employee (Wipe traces)
+            await deleteAssociatedRecords(empId);
 
-        // 2. Drive Cleanup
-        const empData = docSnap.data() as any;
-        const employeeName = empData.applicantName || 'Unknown';
-        const folderName = empData.driveFolderName;
-        permanentDeleteEmployeeFolder(employeeName, empId, folderName).catch(e => log.error("Purge Drive Error:", e));
+            // 2. Drive Cleanup
+            const empData = docSnap.data() as any;
+            const employeeName = empData.applicantName || 'Unknown';
+            const folderName = empData.driveFolderName;
+            permanentDeleteEmployeeFolder(employeeName, empId, folderName).catch(e => log.error("Purge Drive Error:", e));
 
-        // 3. Main Doc Delete
-        await deleteDoc(docSnap.ref);
+            // 3. Main Doc Delete
+            await deleteDoc(docSnap.ref);
+        }));
     }
 
     return snap.size;
@@ -4408,7 +4527,7 @@ export const getEmployeeTimeline = async (employeeId: string): Promise<TimelineE
     // 1. Deep resolution of employee or submission data
     const empData: any = await getEmployeeById(employeeId);
 
-    // Collect all related IDs (doc ID, employeeId, submissionId, temporaryId, previousEmployeeId)
+    // Collect all related IDs (doc ID, employeeId, submissionId, temporaryId, previousEmployeeId, uid, linkedUid, portalId) (UDF-AUD-211)
     const idSet = new Set<string>([employeeId, employeeId.trim(), employeeId.trim().toUpperCase()]);
     if (empData) {
         if (empData.id) idSet.add(empData.id);
@@ -4416,6 +4535,9 @@ export const getEmployeeTimeline = async (employeeId: string): Promise<TimelineE
         if (empData.submissionId) idSet.add(empData.submissionId);
         if (empData.temporaryId) idSet.add(empData.temporaryId);
         if (empData.previousEmployeeId) idSet.add(empData.previousEmployeeId);
+        if (empData.uid) idSet.add(empData.uid);
+        if (empData.linkedUid) idSet.add(empData.linkedUid);
+        if (empData.portalId) idSet.add(empData.portalId);
     }
     const relatedIds = Array.from(idSet).filter(Boolean);
     const primaryEmpId = empData?.employeeId || employeeId;
@@ -4584,11 +4706,13 @@ export const getEmployeeTimeline = async (employeeId: string): Promise<TimelineE
         });
     } catch (_) {}
 
-    // 9. Fetch Data Correction Requests across all related IDs
+    // 9. Fetch Data Correction Requests across all related IDs (UDF-AUD-92: query targetId and submissionId)
     try {
-        const corrPromises = relatedIds.map(rid => 
-            getDocs(query(collection(db, 'correction_requests'), where('submissionId', '==', rid))).catch(() => ({ forEach: () => {} } as any))
-        );
+        const corrPromises: Promise<any>[] = [];
+        relatedIds.forEach(rid => {
+            corrPromises.push(getDocs(query(collection(db, 'correction_requests'), where('targetId', '==', rid))).catch(() => ({ forEach: () => {} } as any)));
+            corrPromises.push(getDocs(query(collection(db, 'correction_requests'), where('submissionId', '==', rid))).catch(() => ({ forEach: () => {} } as any)));
+        });
         const corrSnaps = await Promise.all(corrPromises);
         const seenCorrIds = new Set<string>();
 
@@ -4597,12 +4721,63 @@ export const getEmployeeTimeline = async (employeeId: string): Promise<TimelineE
                 if (seenCorrIds.has(d.id)) return;
                 seenCorrIds.add(d.id);
                 const data = d.data();
+                const fieldLabels = Array.isArray(data.targetFieldLabels) && data.targetFieldLabels.length > 0
+                    ? data.targetFieldLabels
+                    : Array.isArray(data.requestedFieldDefinitions) && data.requestedFieldDefinitions.length > 0
+                        ? data.requestedFieldDefinitions.map((f: any) => f.label || f.name || f.id)
+                        : Array.isArray(data.requestedFields) && data.requestedFields.length > 0
+                            ? data.requestedFields
+                            : [];
                 events.push({
                     id: `corr-${d.id}`,
                     type: 'UPDATE',
                     date: safeIsoDate(data.requestedAt || data.createdAt),
                     title: 'Profile Correction Request',
-                    description: `Correction link generated for fields: ${(data.targetFieldLabels || []).join(', ') || 'Profile data'}. Status: ${data.status || 'Pending'}`,
+                    description: `Correction link generated for fields: ${fieldLabels.join(', ') || 'Profile data'}. Status: ${data.status || 'Pending'}`,
+                    status: data.status,
+                    employeeId: primaryEmpId
+                });
+            });
+        });
+    } catch (_) {}
+
+    // 9.5. Fetch Account Updates & Resignations across all related IDs (UDF-AUD-92)
+    try {
+        const [updateSnaps, resigSnaps] = await Promise.all([
+            Promise.all(relatedIds.map(rid => getDocs(query(collection(db, 'account_updates'), where('employeeId', '==', rid))).catch(() => ({ forEach: () => {} } as any)))),
+            Promise.all(relatedIds.map(rid => getDocs(query(collection(db, 'resignations'), where('employeeId', '==', rid))).catch(() => ({ forEach: () => {} } as any))))
+        ]);
+
+        const seenUpdateIds = new Set<string>();
+        updateSnaps.forEach(snap => {
+            snap.forEach((d: any) => {
+                if (seenUpdateIds.has(d.id)) return;
+                seenUpdateIds.add(d.id);
+                const data = d.data();
+                events.push({
+                    id: `upd-${d.id}`,
+                    type: 'UPDATE',
+                    date: safeIsoDate(data.submittedAt || data.createdAt || data.date),
+                    title: `Profile Update Request: ${data.fieldLabel || 'Details'}`,
+                    description: `Requested update for ${data.fieldLabel || 'profile info'}. Status: ${data.status || 'Pending'}.`,
+                    status: data.status,
+                    employeeId: primaryEmpId
+                });
+            });
+        });
+
+        const seenResigIds = new Set<string>();
+        resigSnaps.forEach(snap => {
+            snap.forEach((d: any) => {
+                if (seenResigIds.has(d.id)) return;
+                seenResigIds.add(d.id);
+                const data = d.data();
+                events.push({
+                    id: `resig-${d.id}`,
+                    type: 'RESIGNATION',
+                    date: safeIsoDate(data.submittedAt || data.relievingDate || data.createdAt),
+                    title: 'Resignation Request Submitted',
+                    description: `Requested relieving on ${data.relievingDate || 'N/A'}. Reason: ${data.reason || 'Personal reasons'}. Status: ${data.status || 'Pending'}.`,
                     status: data.status,
                     employeeId: primaryEmpId
                 });
@@ -4629,7 +4804,7 @@ export const getEmployeeTimeline = async (employeeId: string): Promise<TimelineE
 };
 
 // --- Search All Employees ---
-export const searchAllEmployees = async (searchTerm: string) => {
+export const searchAllEmployees = async (searchTerm: string, allowedSiteIds?: string[]) => {
     const results: any[] = [];
     if (!searchTerm.trim()) return results;
 
@@ -4690,6 +4865,7 @@ export const searchAllEmployees = async (searchTerm: string) => {
             const extractName = (d: any) => d.applicantName || d.profileData?.applicantName || d.profileData?.['Applicant Name'] || d.profileData?.['Full Name'] || d.data?.['Applicant Name'] || d.data?.['Full Name'] || d.name || 'Unknown';
             const extractDesignation = (d: any) => d.designation || d.profileData?.designation || d.data?.designation || 'Security Guard';
             const extractSite = (d: any) => d.currentSite || d.siteName || d.profileData?.currentSite || d.siteId || 'N/A';
+            const extractSiteId = (d: any) => d.siteId || d.currentSiteId || d.profileData?.siteId || d.profileData?.currentSiteId || d.data?.siteId || d.currentSite || d.siteName || '';
 
             results.push({
                 id: id,
@@ -4698,9 +4874,10 @@ export const searchAllEmployees = async (searchTerm: string) => {
                 designation: extractDesignation(data),
                 status: isSubmission 
                     ? `Submission (${data.status || 'Pending'})` 
-                    : (data.isDeleted ? 'Recycle Bin' : data.isRelieved ? 'Relieved' : 'Active'),
+                    : (Boolean(data.deletedAt || data.isDeleted) ? 'Recycle Bin' : data.isRelieved ? 'Relieved' : 'Active'),
                 type: isSubmission ? 'SUBMISSION' : 'EMPLOYEE',
-                siteName: extractSite(data)
+                siteName: extractSite(data),
+                siteId: extractSiteId(data)
             });
         });
     });
@@ -4715,14 +4892,16 @@ export const searchAllEmployees = async (searchTerm: string) => {
                 const extractName = (d: any) => d.applicantName || d.profileData?.applicantName || d.profileData?.['Applicant Name'] || d.profileData?.['Full Name'] || d.data?.['Applicant Name'] || d.data?.['Full Name'] || d.name || 'Unknown';
                 const extractDesignation = (d: any) => d.designation || d.profileData?.designation || d.data?.designation || 'Security Guard';
                 const extractSite = (d: any) => d.currentSite || d.siteName || d.profileData?.currentSite || d.siteId || 'N/A';
+                const extractSiteId = (d: any) => d.siteId || d.currentSiteId || d.profileData?.siteId || d.profileData?.currentSiteId || d.data?.siteId || d.currentSite || d.siteName || '';
                 results.unshift({
                     id: termUpper,
                     name: extractName(data),
                     employeeId: data.employeeId || termUpper,
                     designation: extractDesignation(data),
-                    status: data.isDeleted ? 'Recycle Bin' : data.isRelieved ? 'Relieved' : 'Active',
+                    status: Boolean(data.deletedAt || data.isDeleted) ? 'Recycle Bin' : data.isRelieved ? 'Relieved' : 'Active',
                     type: 'EMPLOYEE',
-                    siteName: extractSite(data)
+                    siteName: extractSite(data),
+                    siteId: extractSiteId(data)
                 });
             }
         } catch (_) {}
@@ -4737,6 +4916,7 @@ export const searchAllEmployees = async (searchTerm: string) => {
                 const extractName = (d: any) => d.applicantName || d.profileData?.applicantName || d.profileData?.['Applicant Name'] || d.profileData?.['Full Name'] || d.data?.['Applicant Name'] || d.data?.['Full Name'] || d.name || 'Unknown';
                 const extractDesignation = (d: any) => d.designation || d.profileData?.designation || d.data?.designation || 'Security Guard';
                 const extractSite = (d: any) => d.currentSite || d.siteName || d.profileData?.currentSite || d.siteId || 'N/A';
+                const extractSiteId = (d: any) => d.siteId || d.currentSiteId || d.profileData?.siteId || d.profileData?.currentSiteId || d.data?.siteId || d.currentSite || d.siteName || '';
                 results.unshift({
                     id: rawTerm,
                     name: extractName(data),
@@ -4744,10 +4924,19 @@ export const searchAllEmployees = async (searchTerm: string) => {
                     designation: extractDesignation(data),
                     status: `Submission (${data.status || 'Pending'})`,
                     type: 'SUBMISSION',
-                    siteName: extractSite(data)
+                    siteName: extractSite(data),
+                    siteId: extractSiteId(data)
                 });
             }
         } catch (_) {}
+    }
+
+    // Enforce Site-Scoping for delegated supervisors (UDF-AUD-92)
+    if (allowedSiteIds && allowedSiteIds.length > 0) {
+        return results.filter(r => {
+            const sId = r.siteId || r.siteName;
+            return sId && (allowedSiteIds.includes(r.siteId) || allowedSiteIds.includes(r.siteName));
+        });
     }
 
     return results;
@@ -5380,7 +5569,32 @@ export const getAllCorrectionRequests = async (): Promise<CorrectionRequest[]> =
 
 export const revokeCorrectionRequest = async (requestId: string): Promise<void> => {
     const docRef = doc(db, CORRECTION_REQUESTS_COLLECTION, requestId);
-    await updateDoc(docRef, { status: 'expired' });
+    const snap = await getDoc(docRef);
+    if (snap.exists()) {
+        const data = snap.data();
+        await updateDoc(docRef, { status: 'expired' });
+        // Clear activeCorrectionToken on target document so new links can be created (UDF-AUD-94)
+        if (data.targetId) {
+            try {
+                if (data.targetType === 'submission') {
+                    const targetRef = doc(db, SUBMISSIONS_COLLECTION, data.targetId);
+                    await updateDoc(targetRef, {
+                        activeCorrectionToken: null,
+                        hasActiveCorrectionToken: false
+                    });
+                } else {
+                    const resolvedEmp = await resolveEmployeeDoc(data.targetId);
+                    const empRef = resolvedEmp?.ref || doc(db, EMPLOYEES_COLLECTION, data.targetId);
+                    await updateDoc(empRef, {
+                        activeCorrectionToken: null,
+                        hasActiveCorrectionToken: false
+                    });
+                }
+            } catch (err) {
+                console.warn("[revokeCorrectionRequest] Could not clear token on target doc:", err);
+            }
+        }
+    }
     await logSystemAction('UPDATE', 'EMPLOYEES', `Revoked data correction request link ${requestId}`);
 };
 
@@ -5393,16 +5607,21 @@ export const deleteCorrectionRequest = async (
     const docRef = doc(db, CORRECTION_REQUESTS_COLLECTION, requestId);
     await deleteDoc(docRef);
     
-    // 2. Clear activeCorrectionToken on target doc if it matches
-    const targetColl = targetType === 'employee' ? EMPLOYEES_COLLECTION : SUBMISSIONS_COLLECTION;
-    const targetRef = doc(db, targetColl, targetId);
+    // 2. Clear activeCorrectionToken on target doc (UDF-AUD-94)
     try {
-        const targetSnap = await getDoc(targetRef);
-        if (targetSnap.exists()) {
-            const data = targetSnap.data() as any;
-            if (data.activeCorrectionToken === requestId) {
-                await updateDoc(targetRef, { activeCorrectionToken: null });
-            }
+        if (targetType === 'submission') {
+            const targetRef = doc(db, SUBMISSIONS_COLLECTION, targetId);
+            await updateDoc(targetRef, { 
+                activeCorrectionToken: null,
+                hasActiveCorrectionToken: false
+            });
+        } else {
+            const resolvedEmp = await resolveEmployeeDoc(targetId);
+            const empRef = resolvedEmp?.ref || doc(db, EMPLOYEES_COLLECTION, targetId);
+            await updateDoc(empRef, { 
+                activeCorrectionToken: null,
+                hasActiveCorrectionToken: false
+            });
         }
     } catch (err) {
         log.error("Failed to clear target activeCorrectionToken on request delete:", err);

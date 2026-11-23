@@ -17,11 +17,12 @@ interface EmployeeResignationPageProps {
   workflowConfigs?: WorkflowConfig[];
   activeAssignments?: any[];
   sites?: any[];
+  currentSiteId?: string;
 }
 
 const EmployeeResignationPage: React.FC<EmployeeResignationPageProps> = ({
   employeeId, employeeData, existingRequests, onSubmitRequest, formSections, roles, workflowConfigs,
-  activeAssignments = [], sites = []
+  activeAssignments = [], sites = [], currentSiteId
 }) => {
   const [resignationDate, setResignationDate] = useState('');
   const [reason, setReason] = useState('');
@@ -32,6 +33,12 @@ const EmployeeResignationPage: React.FC<EmployeeResignationPageProps> = ({
   // State for the notice period popup
   const [isNoticeModalOpen, setIsNoticeModalOpen] = useState(false);
   const [calculatedRelievingDate, setCalculatedRelievingDate] = useState('');
+
+  const hasActiveResignation = useMemo(() => {
+    return (existingRequests || []).some(
+      r => r.status === RequestStatus.PENDING || r.status === RequestStatus.APPROVED
+    );
+  }, [existingRequests]);
 
   const today = new Date().toISOString().split('T')[0];
 
@@ -88,9 +95,14 @@ const EmployeeResignationPage: React.FC<EmployeeResignationPageProps> = ({
       return;
     }
 
-    const finalSiteId = activeDeployments.length > 1 
-      ? selectedSiteId 
-      : (activeDeployments[0]?.siteId || '');
+    if (hasActiveResignation) {
+      alert("You already have an active resignation under review.");
+      return;
+    }
+
+    const finalSiteId = activeDeployments.length > 1
+      ? selectedSiteId
+      : (activeDeployments[0]?.siteId || currentSiteId || (employeeData as any)?.currentSiteId || (sites && sites.length === 1 ? sites[0].id : '') || 'UNASSIGNED');
 
     const selectedSiteObj = sites?.find(s => s.id === finalSiteId);
     const finalUnitValue = selectedSiteObj ? selectedSiteObj.name : unitValue;
@@ -147,11 +159,23 @@ const EmployeeResignationPage: React.FC<EmployeeResignationPageProps> = ({
 
   return (
     <div className="bg-white shadow-xl rounded-lg p-6 md:p-8">
+      {hasActiveResignation && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-amber-800 text-sm flex items-center gap-3 mb-6">
+          <AlertTriangle className="text-amber-600 flex-shrink-0" size={20} />
+          <div>
+            <p className="font-bold">Active Resignation Under Review</p>
+            <p className="text-xs text-amber-700">You already have an active resignation request pending or approved. You cannot submit multiple resignations.</p>
+          </div>
+        </div>
+      )}
+
       <div className="flex justify-between items-center mb-6 border-b pb-3">
         <h2 className="text-2xl font-semibold text-gray-800">Resignation & Exit</h2>
-        <Button onClick={() => setShowForm(!showForm)} variant="danger" size="sm" className="bg-red-600 hover:bg-red-700">
-          <UserMinus size={16} className="mr-2" /> {showForm ? 'Cancel' : 'Submit Resignation'}
-        </Button>
+        {!hasActiveResignation && (
+          <Button onClick={() => setShowForm(!showForm)} variant="danger" size="sm" className="bg-red-600 hover:bg-red-700">
+            <UserMinus size={16} className="mr-2" /> {showForm ? 'Cancel' : 'Submit Resignation'}
+          </Button>
+        )}
       </div>
 
       {showForm && (

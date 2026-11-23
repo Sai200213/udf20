@@ -29,15 +29,35 @@ export const permanentDeleteEmployeeFolder = async (employeeName: string, _uniqu
 };
 
 export const renameEmployeeFolder = async (oldName: string, newName: string): Promise<void> => {
-    log.log(`[DRIVE_SERVICE] Rename bypassed: ${oldName} -> ${newName} (server-managed).`);
+    log.log(`[DRIVE_SERVICE] Renaming folder: ${oldName} -> ${newName} (server-managed).`);
+    try {
+        const fn = httpsCallable(functions, 'syncEmployeeToGoogleDriveServer');
+        await fn({ recordId: newName, oldName });
+    } catch (e) {
+        log.warn('[DRIVE_SERVICE] renameEmployeeFolder server sync warning:', e);
+    }
 };
 
 export const approveEmployeeFolder = async (oldFolderName: string, newFolderName: string): Promise<void> => {
-    log.log(`[DRIVE_SERVICE] Approve folder move bypassed: ${oldFolderName} -> ${newFolderName} (server-managed).`);
+    log.log(`[DRIVE_SERVICE] Approve folder: ${oldFolderName} -> ${newFolderName}`);
+    if (newFolderName) {
+        try {
+            await syncEmployeeToGoogleDrive(newFolderName, 'employee');
+        } catch (e) {
+            log.warn('[DRIVE_SERVICE] approveEmployeeFolder sync warning:', e);
+        }
+    }
 };
 
 export const createEmployeeFolder = async (employeeName: string, uniqueId: string): Promise<void> => {
-    log.log(`[DRIVE_SERVICE] createEmployeeFolder bypassed for ${employeeName} (${uniqueId}) (server-managed).`);
+    log.log(`[DRIVE_SERVICE] createEmployeeFolder for ${employeeName} (${uniqueId})`);
+    if (uniqueId) {
+        try {
+            await syncEmployeeToGoogleDrive(uniqueId, 'employee');
+        } catch (e) {
+            log.warn('[DRIVE_SERVICE] createEmployeeFolder sync warning:', e);
+        }
+    }
 };
 
 export const copyFolderContents = async (_sourceFolderName: string, _targetFolderName: string): Promise<void> => {

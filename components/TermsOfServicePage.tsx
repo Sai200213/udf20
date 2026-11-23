@@ -1,7 +1,6 @@
 import React, { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FileText, ArrowLeft, ExternalLink } from 'lucide-react';
-import AdSenseUnit from './common/AdSenseUnit';
 import SEOHead from '../src/components/common/SEOHead';
 
 const TermsOfServicePage: React.FC = () => {
@@ -22,16 +21,16 @@ const TermsOfServicePage: React.FC = () => {
             <nav className="bg-white shadow-xs sticky top-0 z-50">
                 <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
                     <div className="flex justify-between h-16 items-center">
-                        <div className="flex items-center space-x-3 cursor-pointer" onClick={() => navigate('/')}>
+                        <a href="/" onClick={(e) => { e.preventDefault(); navigate('/'); }} className="flex items-center space-x-3 cursor-pointer">
                             <div className="bg-blue-600 p-2 rounded-lg">
                                 <ExternalLink className="text-white h-5 w-5" />
                             </div>
                             <span className="text-xl font-bold text-gray-900 tracking-tight">Unique Delta Force</span>
-                        </div>
+                        </a>
                         <div className="flex items-center space-x-6">
-                            <span onClick={() => navigate('/about')} className="text-sm text-gray-600 hover:text-blue-600 font-medium cursor-pointer">About Us</span>
-                            <span onClick={() => navigate('/')} className="text-sm text-gray-600 hover:text-blue-600 font-medium cursor-pointer">Careers</span>
-                            <span onClick={() => navigate('/contact')} className="text-sm text-gray-600 hover:text-blue-600 font-medium cursor-pointer">Contact</span>
+                            <a href="/about" onClick={(e) => { e.preventDefault(); navigate('/about'); }} className="text-sm text-gray-600 hover:text-blue-600 font-medium cursor-pointer">About Us</a>
+                            <a href="/careers" onClick={(e) => { e.preventDefault(); navigate('/careers'); }} className="text-sm text-gray-600 hover:text-blue-600 font-medium cursor-pointer">Careers</a>
+                            <a href="/contact" onClick={(e) => { e.preventDefault(); navigate('/contact'); }} className="text-sm text-gray-600 hover:text-blue-600 font-medium cursor-pointer">Contact</a>
                         </div>
                     </div>
                 </div>
@@ -106,9 +105,9 @@ const TermsOfServicePage: React.FC = () => {
                     </div>
 
                     <div>
-                        <h2 className="text-xl font-bold text-gray-900 mb-3">6. Third-Party Links & Ads</h2>
+                        <h2 className="text-xl font-bold text-gray-900 mb-3">6. Third-Party Links</h2>
                         <p>
-                            We may show third-party ads provided by Google AdSense on our portal. We are not responsible for the content, privacy practices, or safety of any linked external sites or products promoted in advertisements.
+                            Our website may contain links to external third-party resources. We are not responsible for the content, privacy practices, or security of any linked external sites.
                         </p>
                     </div>
 
@@ -124,10 +123,6 @@ const TermsOfServicePage: React.FC = () => {
                         <p>
                             Any claim relating to this website or services shall be governed by the laws of India, and any disputes shall fall under the exclusive jurisdiction of the courts located in Hyderabad, Telangana.
                         </p>
-                    </div>
-
-                    <div className="my-8">
-                        <AdSenseUnit slot="2222222222" format="auto" />
                     </div>
                 </div>
             </div>

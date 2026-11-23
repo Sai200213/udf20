@@ -83,9 +83,17 @@ const EmployeeDashboardPage: React.FC<EmployeeDashboardPageProps> = (props) => {
 
   // Security Modal State
   const [showSecurityModal, setShowSecurityModal] = useState(false);
-  const [securityAction, setSecurityAction] = useState<'change_password' | 'link_google'>('change_password');
+  const [securityAction, setSecurityAction] = useState<'change_password' | 'link_google' | 'change_google'>('change_password');
   const [isForcedSecurity, setIsForcedSecurity] = useState(false);
   const [isMoreSheetOpen, setIsMoreSheetOpen] = useState(false);
+
+  const handleSecurityModalClose = () => {
+    setShowSecurityModal(false);
+    setIsForcedSecurity(false);
+    if (employeeData) {
+      (employeeData as any).isDefaultPassword = false;
+    }
+  };
 
   // Auto-open forced security setup for default-password employees
   useEffect(() => {
@@ -180,13 +188,16 @@ const EmployeeDashboardPage: React.FC<EmployeeDashboardPageProps> = (props) => {
     const isViewAllowed = navItems.some(item => item.view === activeView);
     const viewToRender = isViewAllowed ? activeView : AppView.EMPLOYEE_PROFILE;
 
+    const resolvedEmployeeId = (employeeData as any)?.employeeId || authUser?.employeeId || (employeeData as any)?.portalId || (authUser as any)?.portalId || (employeeData as any)?.id || authUser?.id || '';
+    const resolvedSiteId = (employeeData as any)?.currentSiteId || (employeeData as any)?.siteId || '';
+
     switch (viewToRender) {
       case AppView.EMPLOYEE_PROFILE:
         content = <EmployeeProfileView employeeData={employeeData} fallbackFormSections={formSections} portalConfig={portalConfig} sites={sites} />;
         break;
       case AppView.EMPLOYEE_LEAVE_REQUESTS:
         content = <EmployeeLeaveRequestPage
-          employeeId={authUser?.id || ''}
+          employeeId={resolvedEmployeeId}
           existingRequests={leaveRequests}
           onSubmitRequest={onSubmitLeaveRequest}
           roles={roles}
@@ -195,11 +206,12 @@ const EmployeeDashboardPage: React.FC<EmployeeDashboardPageProps> = (props) => {
           leavePolicy={leavePolicy}
           activeAssignments={(employeeData as any)?.activeAssignments}
           sites={sites}
+          currentSiteId={resolvedSiteId}
         />;
         break;
       case AppView.EMPLOYEE_ACCOUNT_UPDATES:
         content = <EmployeeAccountUpdatePage
-          employeeId={authUser?.id || ''}
+          employeeId={resolvedEmployeeId}
           employeeData={employeeData}
           existingRequests={accountUpdateRequests}
           onSubmitRequest={onSubmitAccountUpdateRequest}
@@ -210,7 +222,7 @@ const EmployeeDashboardPage: React.FC<EmployeeDashboardPageProps> = (props) => {
         break;
       case AppView.EMPLOYEE_RESIGNATION:
         content = <EmployeeResignationPage
-          employeeId={authUser?.id || ''}
+          employeeId={resolvedEmployeeId}
           employeeData={employeeData}
           existingRequests={resignationRequests}
           onSubmitRequest={onSubmitResignationRequest}
@@ -219,6 +231,7 @@ const EmployeeDashboardPage: React.FC<EmployeeDashboardPageProps> = (props) => {
           workflowConfigs={workflowConfigs}
           activeAssignments={(employeeData as any)?.activeAssignments}
           sites={sites}
+          currentSiteId={resolvedSiteId}
         />;
         break;
       case AppView.EMPLOYEE_DISCIPLINARY:
@@ -410,7 +423,7 @@ const EmployeeDashboardPage: React.FC<EmployeeDashboardPageProps> = (props) => {
         {/* Security Modal */}
         <SecuritySettingsModal
           isOpen={showSecurityModal}
-          onClose={() => { setShowSecurityModal(false); setIsForcedSecurity(false); }}
+          onClose={handleSecurityModalClose}
           isForced={isForcedSecurity}
           initialTab={securityAction}
           employeeId={employeeData.employeeId || authUser?.id || ''}
@@ -610,7 +623,7 @@ const EmployeeDashboardPage: React.FC<EmployeeDashboardPageProps> = (props) => {
       {/* Security Modal */}
       <SecuritySettingsModal
         isOpen={showSecurityModal}
-        onClose={() => { setShowSecurityModal(false); setIsForcedSecurity(false); }}
+        onClose={handleSecurityModalClose}
         isForced={isForcedSecurity}
         initialTab={securityAction}
         employeeId={employeeData.employeeId || authUser?.id || ''}

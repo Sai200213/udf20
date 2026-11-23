@@ -55,8 +55,16 @@ const AdminStaffProfilePage: React.FC<AdminStaffProfilePageProps> = ({
   };
 
   const assignedSites = useMemo(() => {
-    return sites.filter(s => s.supervisorId === authUser?.id && s.status === 'Active');
-  }, [sites, authUser]);
+    return sites.filter(s => {
+      if (s.status !== 'Active') return false;
+      const isDirect = s.supervisorId === authUser?.id;
+      const isInSupervisors = Array.isArray(s.supervisorIds) && s.supervisorIds.includes(authUser?.id);
+      const isManaged = Array.isArray(staffDetails?.sitesManaged) && (
+        staffDetails.sitesManaged.includes(s.id) || staffDetails.sitesManaged.includes(s.name)
+      );
+      return isDirect || isInSupervisors || isManaged;
+    });
+  }, [sites, authUser, staffDetails]);
 
   const totalPersonnelManagedDirectly = useMemo(() => {
     return assignedSites.reduce((acc, site) => acc + getSiteHeadcount(site.name), 0);
@@ -68,12 +76,21 @@ const AdminStaffProfilePage: React.FC<AdminStaffProfilePageProps> = ({
 
     // Field Officers are usually role-field-officer or similar
     const fieldOfficers = staffUsers.filter(s => {
+      if (s.isDisabled === true || (s as any).isActive === false) return false;
       const role = roles.find(r => r.id === s.roleId);
       return role?.name.toLowerCase().includes('field officer') || role?.id === 'role-field-officer';
     });
 
     return fieldOfficers.map(fo => {
-      const foSites = sites.filter(s => s.supervisorId === fo.id && s.status === 'Active');
+      const foSites = sites.filter(s => {
+        if (s.status !== 'Active') return false;
+        const isDirect = s.supervisorId === fo.id;
+        const isInSupervisors = Array.isArray(s.supervisorIds) && s.supervisorIds.includes(fo.id);
+        const isManaged = Array.isArray(fo.sitesManaged) && (
+          fo.sitesManaged.includes(s.id) || fo.sitesManaged.includes(s.name)
+        );
+        return isDirect || isInSupervisors || isManaged;
+      });
       const foHeadcount = foSites.reduce((acc, site) => acc + getSiteHeadcount(site.name), 0);
       return {
         ...fo,

@@ -113,7 +113,27 @@ const DocumentUploadWizard: React.FC<DocumentUploadWizardProps> = ({
         }
     };
 
-    // Validate current step
+    // Pure validity check without mutating state during render
+    const isDetailsStepValid = (): boolean => {
+        for (const section of formSections) {
+            for (const field of section.fields) {
+                if (
+                    field.type === FieldType.FILE_UPLOAD ||
+                    field.type === FieldType.HEADER ||
+                    field.type === FieldType.INFO_TEXT
+                ) continue;
+
+                const val = formData[field.id];
+                const isEmpty = val === undefined || val === null || String(val).trim() === '';
+                if (field.isMandatory && isEmpty) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    // Validate current step with state mutation (only on button click / form progression)
     const validateDetailsStep = (): boolean => {
         const errors: Record<string, string> = {};
         
@@ -197,7 +217,7 @@ const DocumentUploadWizard: React.FC<DocumentUploadWizardProps> = ({
                     </button>
                     <span className="text-gray-300">/</span>
                     <button 
-                        disabled={isFinishing || !validateDetailsStep()}
+                        disabled={isFinishing || !isDetailsStepValid()}
                         onClick={() => { if(validateDetailsStep()) setStep('documents'); }}
                         className={`flex items-center space-x-2 pb-2 border-b-2 transition-all text-sm font-semibold ${step === 'documents' ? 'border-emerald-600 text-emerald-700' : 'border-transparent text-gray-400 hover:text-gray-600'}`}
                     >
@@ -206,7 +226,7 @@ const DocumentUploadWizard: React.FC<DocumentUploadWizardProps> = ({
                     </button>
                     <span className="text-gray-300">/</span>
                     <button 
-                        disabled={isFinishing || !validateDetailsStep() || !allDocumentsUploaded}
+                        disabled={isFinishing || !isDetailsStepValid() || !allDocumentsUploaded}
                         onClick={() => { if(validateDetailsStep() && allDocumentsUploaded) setStep('review'); }}
                         className={`flex items-center space-x-2 pb-2 border-b-2 transition-all text-sm font-semibold ${step === 'review' ? 'border-emerald-600 text-emerald-700' : 'border-transparent text-gray-400 hover:text-gray-600'}`}
                     >
@@ -226,7 +246,7 @@ const DocumentUploadWizard: React.FC<DocumentUploadWizardProps> = ({
 
                     {detailFieldsBySection.map(section => (
                         <div key={section.id} className="bg-gray-50/50 p-6 rounded-xl border border-gray-100">
-                            <h3 className="text-md font-bold text-gray-700 border-b border-gray-200/60 pb-2 mb-4">{section.title}</h3>
+                            <h3 className="text-md font-bold text-gray-700 border-b border-gray-200/60 pb-2 mb-4">{section.name || section.title}</h3>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {section.fields.map(field => {
                                     const error = validationErrors[field.id];
@@ -425,7 +445,7 @@ const DocumentUploadWizard: React.FC<DocumentUploadWizardProps> = ({
                     <div className="bg-gray-50/50 rounded-xl border border-gray-150 p-6 space-y-6 max-h-[400px] overflow-y-auto custom-scrollbar">
                         {formSections.map(section => (
                             <div key={section.id} className="border-b border-gray-200/60 last:border-none pb-4 last:pb-0">
-                                <h3 className="text-xs font-bold text-emerald-800 uppercase tracking-widest mb-3">{section.title}</h3>
+                                <h3 className="text-xs font-bold text-emerald-800 uppercase tracking-widest mb-3">{section.name || section.title}</h3>
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 text-sm">
                                      {section.fields
                                         .filter(f => f.type !== FieldType.HEADER && f.type !== FieldType.INFO_TEXT)

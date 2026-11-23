@@ -68,26 +68,27 @@ const PublicHeader: React.FC = () => {
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
                 <div className="flex justify-between h-16 items-center">
                     {/* Logo Area */}
-                    <div className="flex items-center space-x-3 cursor-pointer" onClick={() => handleNavClick('/')}>
+                    <a href="/" onClick={(e) => { e.preventDefault(); handleNavClick('/'); }} className="flex items-center space-x-3 cursor-pointer">
                         <img src="/logo.png" alt="Logo" className="h-9 w-auto" />
                         <span className="text-lg sm:text-xl font-black text-gray-900 tracking-tight">
                             Unique Delta Force
                         </span>
-                    </div>
+                    </a>
 
                     {/* Desktop Navigation links */}
                     <div className="hidden md:flex items-center space-x-6 lg:space-x-8">
                         {navItems.map(item => (
-                            <span
+                            <a
                                 key={item.path}
-                                onClick={() => handleNavClick(item.path)}
+                                href={item.path}
+                                onClick={(e) => { e.preventDefault(); handleNavClick(item.path); }}
                                 className={`text-sm font-semibold transition-all duration-200 cursor-pointer ${isActive(item.path)
                                         ? 'text-blue-600 border-b-2 border-blue-600 pb-1'
                                         : 'text-slate-600 hover:text-blue-600'
                                     }`}
                             >
                                 {item.label}
-                            </span>
+                            </a>
                         ))}
                     </div>
 
@@ -119,7 +120,7 @@ const PublicHeader: React.FC = () => {
                                                 <>
                                                     <button
                                                         onClick={() => {
-                                                            navigate(user.type === 'Admin' ? '/admin/dashboard' : '/employee/dashboard');
+                                                            window.location.href = user.type === 'Admin' ? 'https://admin.udfonline.in/dashboard' : 'https://employee.udfonline.in/dashboard';
                                                             setShowDropdown(false);
                                                         }}
                                                         className="w-full text-left px-4 py-2.5 hover:bg-slate-50 transition-colors font-semibold flex items-center gap-2"
@@ -180,16 +181,17 @@ const PublicHeader: React.FC = () => {
             {isOpen && (
                 <div className="md:hidden border-t border-slate-200 bg-white px-4 pt-2 pb-4 space-y-2 shadow-inner">
                     {navItems.map(item => (
-                        <div
+                        <a
                             key={item.path}
-                            onClick={() => handleNavClick(item.path)}
-                            className={`px-3 py-2.5 rounded-xl text-sm font-bold cursor-pointer transition-colors ${isActive(item.path)
+                            href={item.path}
+                            onClick={(e) => { e.preventDefault(); handleNavClick(item.path); }}
+                            className={`block px-3 py-2.5 rounded-xl text-sm font-bold cursor-pointer transition-colors ${isActive(item.path)
                                     ? 'bg-blue-50 text-blue-600'
                                     : 'text-slate-700 hover:bg-slate-50'
                                 }`}
                         >
                             {item.label}
-                        </div>
+                        </a>
                     ))}
                     <div className="border-t border-slate-100 pt-3 mt-2">
                         {user ? (
@@ -201,7 +203,7 @@ const PublicHeader: React.FC = () => {
                                 {user.type !== 'Public' && (
                                     <button
                                         onClick={() => {
-                                            navigate(user.type === 'Admin' ? '/admin/dashboard' : '/employee/dashboard');
+                                            window.location.href = user.type === 'Admin' ? 'https://admin.udfonline.in/dashboard' : 'https://employee.udfonline.in/dashboard';
                                             setIsOpen(false);
                                         }}
                                         className="w-full bg-blue-600 text-white text-center py-2.5 rounded-xl text-sm font-bold shadow-sm"

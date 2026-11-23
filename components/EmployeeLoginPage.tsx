@@ -162,8 +162,8 @@ const EmployeeLoginPage: React.FC<EmployeeLoginPageProps> = ({
       } catch (err: any) {
         const appTarget = import.meta.env.VITE_APP_TARGET;
         if ((err.code === 'functions/not-found' || err.message?.includes('not-found') || err.message?.includes('No employee record')) && (appTarget === 'public' || !appTarget)) {
-          const credential = GoogleAuthProvider.credential(googleResult.idToken);
-          await signInWithCredential(auth, credential);
+          const { googleSignIn } = await import('../src/utils/googleAuthHelper');
+          await googleSignIn();
           setIsPublicCandidate(true);
         } else {
           throw err;
@@ -358,10 +358,18 @@ const EmployeeLoginPage: React.FC<EmployeeLoginPageProps> = ({
                       <label className="block text-xs font-medium text-gray-700">Date of Birth</label>
                       <input type="date" className="w-full p-2 border rounded text-sm" value={resetDetails.dob} onChange={(e) => setResetDetails({ ...resetDetails, dob: e.target.value })} required />
                     </div>
+                    {resetStatus === 'error' && <p className="text-red-500 text-sm bg-red-50 p-2 rounded">{resetErrorMsg}</p>}
                     <div className="flex gap-2">
                       <button type="button" onClick={() => setResetStep(1)} className="w-1/3 py-2 bg-gray-200 rounded text-gray-700">Back</button>
                       <button type="button" onClick={() => {
-                        if (resetDetails.name && resetDetails.mobile && resetDetails.aadhar && resetDetails.dob) setResetStep(3);
+                        if (resetDetails.name && resetDetails.mobile && resetDetails.aadhar && resetDetails.dob) {
+                          setResetErrorMsg('');
+                          setResetStatus('idle');
+                          setResetStep(3);
+                        } else {
+                          setResetErrorMsg('Please fill in all 4 verification fields.');
+                          setResetStatus('error');
+                        }
                       }} className="w-2/3 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Verify</button>
                     </div>
                   </div>
@@ -369,7 +377,7 @@ const EmployeeLoginPage: React.FC<EmployeeLoginPageProps> = ({
 
                 {resetStep === 3 && (
                   <div className="space-y-4">
-                    <p className="text-sm text-gray-600">Verification complete. Enter your new password.</p>
+                    <p className="text-sm text-gray-600">Enter your new password to complete identity verification and reset your password.</p>
                     <div>
                       <label className="block text-sm font-medium text-gray-700">New Password</label>
                       <input type="password" className="w-full p-2 border rounded mt-1" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} required minLength={6} />

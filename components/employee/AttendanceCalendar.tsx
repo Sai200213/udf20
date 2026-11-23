@@ -109,39 +109,16 @@ const AttendanceCalendar: React.FC<AttendanceCalendarProps> = ({ userId, userNam
                 setMessage('Attendance marked successfully!');
                 await loadAttendance();
 
-                // If marked as Present today and they had NOT already checked in today, award points!
+                // If marked as Present today and they had NOT already checked in today, award points via secure server callable! (UDF-AUD-16 & UDF-AUD-112)
                 if (selectedStatus === 'P' && !hasAlreadyMarkedToday) {
                     try {
-                        const { db } = await import('../../src/firebase/config');
-                        const { doc, getDoc, setDoc } = await import('firebase/firestore');
-
-                        // 1. Fetch configured attendance points value
-                        let pointsToAdd = 5; // fallback
-                        const rulesRef = doc(db, 'settings', 'gamification_rules');
-                        const rulesSnap = await getDoc(rulesRef);
-                        if (rulesSnap.exists()) {
-                            pointsToAdd = rulesSnap.data().attendancePoints ?? 5;
+                        const { recordAttendancePoints } = await import('../../src/services/engagementService');
+                        const res = await recordAttendancePoints(userId, userName);
+                        if (res.success) {
+                            console.log(`[ATTENDANCE POINTS] Successfully credited attendance points for ${userName}`);
                         }
-
-                        // 2. Load user streak record to add points
-                        const streakRef = doc(db, 'user_engagement', userId);
-                        const streakSnap = await getDoc(streakRef);
-                        let currentPoints = 0;
-                        let streakData = {};
-                        if (streakSnap.exists()) {
-                            streakData = streakSnap.data();
-                            currentPoints = streakSnap.data().points || 0;
-                        }
-
-                        // SEC-17: Do not directly mutate points from client; points are ledgered server-side
-                        await setDoc(streakRef, {
-                            ...streakData,
-                            userId,
-                            userName
-                        }, { merge: true });
-                        console.log(`[ATTENDANCE POINTS] Awarded +${pointsToAdd} points to ${userName}`);
                     } catch (pointsErr) {
-                        console.error("Failed to award attendance points:", pointsErr);
+                        console.error("Failed to award attendance points via server:", pointsErr);
                     }
                 }
 

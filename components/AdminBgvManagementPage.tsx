@@ -134,12 +134,13 @@ export const AdminBgvManagementPage: React.FC<AdminBgvManagementPageProps> = ({
   // 1. Subscribe to real-time BGV records
   useEffect(() => {
     setLoading(true);
+    const effectiveSiteIds = hasScopeAll ? undefined : allowedSiteIds;
     const unsubscribe = subscribeToBgvRecords((data) => {
       setRecords(data);
       setLoading(false);
-    });
+    }, effectiveSiteIds);
     return () => unsubscribe();
-  }, []);
+  }, [hasScopeAll, allowedSiteIds]);
 
   // Sync state with portalConfig when opened
   useEffect(() => {
@@ -241,13 +242,29 @@ export const AdminBgvManagementPage: React.FC<AdminBgvManagementPageProps> = ({
   const filteredRecords = useMemo(() => {
     return records.filter(record => {
       // Scope to allowed sites if supervisor and doesn't have BGV_VIEW_SCOPE_ALL
-      if (!hasScopeAll && allowedSiteIds && allowedSiteIds.length > 0 && !allowedSiteIds.includes(record.siteId)) {
-        return false;
+      if (!hasScopeAll && allowedSiteIds !== undefined) {
+        if (allowedSiteIds.length === 0 || !record.siteId || !allowedSiteIds.includes(record.siteId)) {
+          return false;
+        }
       }
 
-      // If user is a vendor, restrict to cases dispatched to their vendor name (if set)
-      if (isVendor && authUser?.name) {
-        if (record.vendorName && !record.vendorName.toLowerCase().includes(authUser.name.toLowerCase())) {
+      // If user is a vendor, restrict strictly to cases dispatched to their exact vendor name or ID (UDF-AUD-254)
+      if (isVendor) {
+        if (!record.vendorName && !record.vendorId) {
+          return false;
+        }
+        const authName = (authUser?.name || '').trim().toLowerCase();
+        const authEmail = (authUser?.email || '').trim().toLowerCase();
+        const authUsername = ((authUser as any)?.username || '').trim().toLowerCase();
+        const authId = (authUser?.id || '').trim();
+        const recVendorName = (record.vendorName || '').trim().toLowerCase();
+        const recVendorId = (record.vendorId || '').trim();
+
+        const isMatch = (recVendorId && authId && recVendorId === authId) ||
+                        (recVendorName && authName && (recVendorName === authName || recVendorName.includes(authName))) ||
+                        (recVendorName && authEmail && (recVendorName === authEmail || recVendorName.includes(authEmail))) ||
+                        (recVendorName && authUsername && (recVendorName === authUsername || recVendorName.includes(authUsername)));
+        if (!isMatch) {
           return false;
         }
       }

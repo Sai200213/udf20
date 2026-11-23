@@ -1,8 +1,8 @@
 import log from "@/src/utils/logger";
 import { db, functions } from '../firebase/config';
-import { collection, doc, onSnapshot, setDoc, query, where, getDocs } from 'firebase/firestore';
+import { collection, doc, onSnapshot, setDoc, query, where, getDocs, limit, QueryConstraint } from 'firebase/firestore';
 import { httpsCallable } from 'firebase/functions';
-import { LeaveRequest, AccountUpdateRequest, ResignationRequest, DisciplinaryAction } from '../../types';
+import { LeaveRequest, AccountUpdateRequest, ResignationRequest, DisciplinaryAction, RequestStatus } from '../../types';
 import { uploadFile } from './storageService';
 import { logSystemAction } from './auditService';
 
@@ -14,11 +14,32 @@ const DISCIPLINARY_COL = 'disciplinary_actions';
 
 /**
  * Scans an object for any File instances, uploads them to Firebase Storage,
- * and replaces them with their download URLs. Returns a Firestore-safe copy.
+ * and replaces them with their download URLs. Returns a Firestore-safe copy
+ * with all undefined fields recursively removed to prevent setDoc crashes (UDF-AUD-91).
  */
 async function uploadFilesInObject(obj: Record<string, any>, storagePath: string): Promise<Record<string, any>> {
+  const sanitizeFirestoreData = (val: any): any => {
+    if (val === undefined || val === null) return null;
+    if (Array.isArray(val)) {
+      return val.filter(v => v !== undefined).map(sanitizeFirestoreData);
+    }
+    if (typeof val === 'object' && !(val instanceof Date) && !(val instanceof File)) {
+      const cleanObj: Record<string, any> = {};
+      for (const [k, v] of Object.entries(val)) {
+        if (v !== undefined) {
+          cleanObj[k] = sanitizeFirestoreData(v);
+        }
+      }
+      return cleanObj;
+    }
+    return val;
+  };
+
   const result: Record<string, any> = {};
   for (const [key, value] of Object.entries(obj)) {
+    if (value === undefined) {
+      continue;
+    }
     if (value instanceof File) {
       try {
         const url = await uploadFile(value, storagePath, value.name);
@@ -29,27 +50,31 @@ async function uploadFilesInObject(obj: Record<string, any>, storagePath: string
         result[key] = null; // Don't block the save — nullify the failed file
       }
     } else {
-      result[key] = value;
+      result[key] = sanitizeFirestoreData(value);
     }
   }
   return result;
 }
 
 
-// Fetch leave requests by status (one-time query, not a subscription)
-export const fetchLeaveRequestsByStatus = async (status: string, allowedSiteIds?: string[], limitCount?: number): Promise<LeaveRequest[]> => {
-    const q = query(collection(db, LEAVE_REQ_COL), where('status', '==', status));
+// Fetch leave requests by status (one-time query, capped with limit to prevent unbounded reads) (UDF-AUD-268)
+export const fetchLeaveRequestsByStatus = async (status?: string, allowedSiteIds?: string[], limitCount = 200): Promise<LeaveRequest[]> => {
+    const constraints: any[] = [];
+    if (status) {
+        constraints.push(where('status', '==', status));
+    }
+    if (allowedSiteIds && allowedSiteIds.length > 0 && allowedSiteIds.length <= 10) {
+        constraints.push(where('siteId', 'in', allowedSiteIds));
+    }
+    constraints.push(limit(limitCount));
+
+    const q = query(collection(db, LEAVE_REQ_COL), ...constraints);
     const snap = await getDocs(q);
     let results = snap.docs.map(d => ({ ...d.data(), id: d.id } as LeaveRequest));
 
-    // Client-side filter by allowed site IDs if provided
-    if (allowedSiteIds && allowedSiteIds.length > 0) {
+    // Client-side filter by allowed site IDs if > 10 sites provided
+    if (allowedSiteIds && allowedSiteIds.length > 10) {
         results = results.filter(r => allowedSiteIds.includes((r as any).siteId || ''));
-    }
-
-    // Apply limit if provided
-    if (limitCount && limitCount > 0) {
-        results = results.slice(0, limitCount);
     }
 
     return results;
@@ -180,24 +205,59 @@ export const updateResignationRequest = async (request: ResignationRequest) => {
 // Auto-relieve employees whose notice period has concluded
 export const processDueResignations = async (requests: ResignationRequest[]): Promise<void> => {
     if (!requests || requests.length === 0) return;
-    const today = new Date();
-    today.setHours(23, 59, 59, 999);
+    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
 
     const { relieveEmployee } = await import('./employeeService');
 
     for (const req of requests) {
         if (req.status === 'Approved' && !req.isProcessed && req.relievingDate) {
-            const relDate = new Date(req.relievingDate);
-            if (!isNaN(relDate.getTime()) && relDate <= today) {
+            const relDateStr = String(req.relievingDate).split('T')[0];
+            if (relDateStr <= todayStr) {
                 try {
                     await relieveEmployee(req.employeeId, req.relievingDate, 'Resignation');
-                    await setDoc(doc(db, RESIGNATION_COL, req.id), { isProcessed: true }, { merge: true });
+                    // Avoid client-side setDoc on resignations which fails for non-SuperAdmins under firestore.rules (UDF-AUD-269)
+                    // Authoritative process flags and notifications are managed via Cloud Function cron
                     log.log(`[AutoRelieve] Relieved ${req.employeeId} (${req.employeeName}) on relieving date ${req.relievingDate}`);
                 } catch (e) {
                     log.error(`[AutoRelieve] Failed to auto-relieve ${req.employeeId}:`, e);
                 }
             }
         }
+    }
+};
+
+export const fetchResignationRequestsByStatus = async (
+    status: RequestStatus | 'ALL',
+    allowedSiteIds: string[] = [],
+    limitCount: number = 100
+): Promise<ResignationRequest[]> => {
+    try {
+        const colRef = collection(db, RESIGNATION_COL);
+        const constraints: QueryConstraint[] = [];
+
+        if (status !== 'ALL') {
+            constraints.push(where('status', '==', status));
+        }
+
+        if (allowedSiteIds.length > 0 && allowedSiteIds.length <= 10) {
+            constraints.push(where('siteId', 'in', allowedSiteIds));
+        }
+
+        constraints.push(limit(limitCount));
+        const q = query(colRef, ...constraints);
+        const snap = await getDocs(q);
+
+        let results = snap.docs.map(d => ({ ...d.data(), id: d.id } as ResignationRequest));
+
+        if (allowedSiteIds.length > 10) {
+            const siteSet = new Set(allowedSiteIds);
+            results = results.filter(r => r.siteId && siteSet.has(r.siteId));
+        }
+
+        return results;
+    } catch (err) {
+        log.error(`Error fetching resignation requests for status ${status}:`, err);
+        return [];
     }
 };
 
